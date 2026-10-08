@@ -24,17 +24,27 @@ from homeassistant.const import (
     UnitOfPower,
     UnitOfTime,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import StateType
+from homeassistant.util import dt as dt_util
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import ENGINE_TYPES
 
-from .const import CHARGING_CURRENTS, DOMAIN, DYNAMIC_UNIT
+from .const import (
+    CHARGING_CURRENTS,
+    CONF_LIFETIME_AVERAGE_CONSUMPTION,
+    DOMAIN,
+    DYNAMIC_UNIT,
+)
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
+from .driving_energy import DrivingEnergyTracker
 from .entity import HyundaiKiaConnectEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+DRIVING_ENERGY_STORAGE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -249,7 +259,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
         icon="mdi:car-electric",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL,
+        # A rolling 90-day window shrinks as days drop out; with a state
+        # class, statistics would book every shrink as negative usage.
+        # driving_energy is the statistics-safe counterpart.
     ),
     HyundaiKiaSensorEntityDescription(
         key="total_power_regenerated",
@@ -257,7 +269,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
         icon="mdi:car-electric",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL,
+        # Rolling 90-day window, see total_power_consumed.
     ),
     # Need to remove km hard coding.  Underlying API needs this fixed first.  EU always does KM.
     HyundaiKiaSensorEntityDescription(
@@ -583,6 +595,12 @@ async def async_setup_entry(
                     coordinator, coordinator.vehicle_manager.vehicles[vehicle_id]
                 )
             )
+        if vehicle.total_power_consumed is not None:
+            entities.extend(
+                await _async_driving_energy_entities(
+                    hass, config_entry, coordinator, vehicle
+                )
+            )
         entities.append(
             VehicleEntity(coordinator, coordinator.vehicle_manager.vehicles[vehicle_id])
         )
@@ -597,6 +615,145 @@ async def async_setup_entry(
 
 
 PARALLEL_UPDATES = 0
+
+
+async def _async_driving_energy_entities(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+    vehicle: Vehicle,
+) -> list[SensorEntity]:
+    """Set up the driving energy meter and its lifetime estimate."""
+    tracker = DrivingEnergyTracker(
+        Store[dict[str, Any]](
+            hass,
+            DRIVING_ENERGY_STORAGE_VERSION,
+            f"{DOMAIN}.driving_energy.{vehicle.id}",
+        ),
+        vehicle,
+        lambda: dt_util.now().date(),
+    )
+    await tracker.async_load()
+    await tracker.async_process()
+
+    @callback
+    def _schedule_process() -> None:
+        hass.async_create_task(
+            tracker.async_process(), f"{DOMAIN} driving energy {vehicle.id}"
+        )
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_schedule_process))
+    average: float | None = config_entry.options.get(CONF_LIFETIME_AVERAGE_CONSUMPTION)
+    return [
+        DrivingEnergySensor(coordinator, vehicle, tracker),
+        LifetimeDrivingEnergyEstimateSensor(
+            coordinator,
+            vehicle,
+            tracker,
+            # kWh/100 km equals 10 Wh/km.
+            average * 10 if average else None,
+        ),
+    ]
+
+
+class DrivingEnergySensor(SensorEntity, HyundaiKiaConnectEntity):
+    """Driving energy measured since the meter started, for statistics.
+
+    Each poll adds the change of every daily row, so energy lands in the hour
+    it is first reported, and late corrections to earlier days still count.
+    """
+
+    _attr_translation_key = "driving_energy"
+    _attr_icon = "mdi:car-electric"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.WATT_HOUR
+    _attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 2
+
+    def __init__(
+        self,
+        coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+        vehicle: Vehicle,
+        tracker: DrivingEnergyTracker,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, vehicle)
+        self._tracker = tracker
+        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_driving_energy"
+
+    async def async_added_to_hass(self) -> None:
+        """Publish whenever the tracker has saved a change."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self._tracker.add_listener(self.async_write_ha_state))
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the measured energy, or None until the meter has started."""
+        meter = self._tracker.meter
+        if meter is None or not meter.initialized:
+            return None
+        return meter.total_wh
+
+
+class LifetimeDrivingEnergyEstimateSensor(SensorEntity, HyundaiKiaConnectEntity):
+    """Estimated lifetime driving energy, for display only.
+
+    Energy before the meter started is estimated as the odometer at that time
+    times an average consumption. It has no state class, so changing the
+    average never affects statistics.
+    """
+
+    _attr_translation_key = "lifetime_driving_energy_estimate"
+    _attr_icon = "mdi:car-electric"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_native_unit_of_measurement = UnitOfEnergy.WATT_HOUR
+    _attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+        vehicle: Vehicle,
+        tracker: DrivingEnergyTracker,
+        wh_per_km: float | None,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, vehicle)
+        self._tracker = tracker
+        self._wh_per_km = wh_per_km
+        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_lifetime_driving_energy_estimate"
+
+    async def async_added_to_hass(self) -> None:
+        """Publish whenever the tracker has saved a change."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self._tracker.add_listener(self.async_write_ha_state))
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the estimate, or None when it cannot be made."""
+        meter = self._tracker.meter
+        if meter is None:
+            return None
+        return meter.lifetime_estimate_wh(self._wh_per_km)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return what the estimate is based on."""
+        meter = self._tracker.meter
+        if meter is None or not meter.initialized:
+            return {}
+        wh_per_km = self._wh_per_km or meter.api_wh_per_km_at_start
+        return {
+            "measured_since": meter.started,
+            "odometer_at_start_km": meter.odometer_at_start_km,
+            "average_consumption_kwh_per_100km": (
+                round(wh_per_km / 10, 2) if wh_per_km is not None else None
+            ),
+            "average_source": (
+                "configured" if self._wh_per_km else "api_30_day_average"
+            ),
+        }
 
 
 class HyundaiKiaConnectSensor(RestoreSensor, SensorEntity, HyundaiKiaConnectEntity):

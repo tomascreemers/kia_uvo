@@ -81,7 +81,8 @@
           "no_force_refresh_hour_start": "No Force Refresh Start Hour",
           "no_force_refresh_hour_finish": "No Force Refresh Finish Hour",
           "enable_geolocation_entity": "Enable Geolocation Entity using OpenStreetMap",
-          "use_email_with_geocode_api": "Use your Kia email address for Geocode API. Increases polling ability but provides it to the API."
+          "use_email_with_geocode_api": "Use your Kia email address for Geocode API. Increases polling ability but provides it to the API.",
+          "lifetime_average_consumption": "Lifetime average consumption shown by the car (kWh/100 km), used only for the lifetime driving energy estimate"
         }
       }
     }
@@ -416,6 +417,9 @@
       "data": {
         "name": "Data"
       },
+      "driving_energy": {
+        "name": "Driving Energy"
+      },
       "dtc_count": {
         "name": "DTC Count"
       },
@@ -506,6 +510,9 @@
       "last_scanned_at": {
         "name": "Last Scanned At"
       },
+      "lifetime_driving_energy_estimate": {
+        "name": "Lifetime Driving Energy (Estimate)"
+      },
       "next_service_distance": {
         "name": "Next Service"
       },
@@ -534,7 +541,7 @@
         "name": "90 Day Energy Consumption"
       },
       "total_power_regenerated": {
-        "name": "Total Energy Regeneration"
+        "name": "90 Day Energy Regeneration"
       },
       "vehicle_identification_number": {
         "name": "Vehicle Identification Number"
