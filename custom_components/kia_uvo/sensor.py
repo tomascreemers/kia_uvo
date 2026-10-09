@@ -29,6 +29,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import StateType
 from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import EnergyConverter
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import ENGINE_TYPES
 
@@ -39,7 +40,7 @@ from .const import (
     DYNAMIC_UNIT,
 )
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
-from .driving_energy import DrivingEnergyTracker
+from .driving_energy import DrivingEnergyTracker, backfill_statistics
 from .entity import HyundaiKiaConnectEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -631,7 +632,7 @@ async def _async_driving_energy_entities(
             f"{DOMAIN}.driving_energy.{vehicle.id}",
         ),
         vehicle,
-        lambda: dt_util.now().date(),
+        dt_util.now,
     )
     await tracker.async_load()
     await tracker.async_process()
@@ -685,7 +686,69 @@ class DrivingEnergySensor(SensorEntity, HyundaiKiaConnectEntity):
     async def async_added_to_hass(self) -> None:
         """Publish whenever the tracker has saved a change."""
         await super().async_added_to_hass()
-        self.async_on_remove(self._tracker.add_listener(self.async_write_ha_state))
+        self.async_on_remove(self._tracker.add_listener(self._handle_meter_change))
+        await self._async_backfill()
+
+    @callback
+    def _handle_meter_change(self) -> None:
+        self.async_write_ha_state()
+        meter = self._tracker.meter
+        if meter is not None and meter.initialized and not meter.backfilled:
+            self.hass.async_create_task(
+                self._async_backfill(), f"{DOMAIN} driving energy backfill"
+            )
+
+    async def _async_backfill(self) -> None:
+        """Import the days before the meter started, once.
+
+        They go into this sensor's own statistics, strictly before its first
+        state and with sums ending at the zero point, so the chain the
+        recorder compiles afterwards continues unchanged.
+        """
+        meter = self._tracker.meter
+        if meter is None or not meter.initialized or meter.backfilled:
+            return
+        if "recorder" not in self.hass.config.components:
+            return
+        # Imported lazily: the recorder is only needed for this one-off job.
+        from homeassistant.components.recorder.models import (
+            StatisticData,
+            StatisticMeanType,
+            StatisticMetaData,
+        )
+        from homeassistant.components.recorder.statistics import (
+            async_import_statistics,
+        )
+
+        unit = self.unit_of_measurement or UnitOfEnergy.WATT_HOUR
+        rows = backfill_statistics(meter, dt_util.get_default_time_zone())
+        if rows:
+            metadata: StatisticMetaData = {
+                "mean_type": StatisticMeanType.NONE,
+                "has_sum": True,
+                "name": None,
+                "source": "recorder",
+                "statistic_id": self.entity_id,
+                "unit_class": EnergyConverter.UNIT_CLASS,
+                "unit_of_measurement": unit,
+            }
+            statistics: list[StatisticData] = [
+                {
+                    "start": start,
+                    "sum": EnergyConverter.convert(
+                        wh_sum, UnitOfEnergy.WATT_HOUR, unit
+                    ),
+                }
+                for start, wh_sum in rows
+            ]
+            async_import_statistics(self.hass, metadata, statistics)
+            _LOGGER.info(
+                "Imported %d days of driving energy before %s into %s",
+                len(rows),
+                meter.started_at or meter.started,
+                self.entity_id,
+            )
+        await self._tracker.async_mark_backfilled()
 
     @property
     def native_value(self) -> float | None:

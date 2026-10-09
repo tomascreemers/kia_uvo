@@ -10,6 +10,10 @@ adds the change of each day's row since the previous poll.
 Rows are forgotten by age, never because a response lacked them. The library
 reports no rows when the endpoint returns nothing usable, and forgetting rows
 then would count all 30 days again once they come back.
+
+The rows seen when the meter starts are not counted by the meter itself;
+``backfill_statistics`` turns them into hourly statistics placed before the
+meter's first state, so the ~30 days before installation still show up.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import asyncio
 import copy
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, tzinfo
 from typing import Any, Protocol
 
 from hyundai_kia_connect_api import Vehicle
@@ -39,6 +43,9 @@ class DrivingEnergyMeter:
     started: str | None = None
     odometer_at_start_km: float | None = None
     api_wh_per_km_at_start: float | None = None
+    started_at: str | None = None
+    baseline_rows: dict[str, float] | None = None
+    backfilled: bool = False
 
     @property
     def initialized(self) -> bool:
@@ -51,6 +58,7 @@ class DrivingEnergyMeter:
         today: date,
         odometer_km: float | None = None,
         api_wh_per_km: float | None = None,
+        now: datetime | None = None,
     ) -> bool:
         """Apply the latest daily rows; return True if anything changed.
 
@@ -69,7 +77,9 @@ class DrivingEnergyMeter:
         changed = False
         if not self.initialized:
             self.rows = latest
+            self.baseline_rows = dict(latest)
             self.started = today.isoformat()
+            self.started_at = now.isoformat() if now is not None else None
             self.odometer_at_start_km = odometer_km
             self.api_wh_per_km_at_start = api_wh_per_km
             changed = True
@@ -111,7 +121,59 @@ class DrivingEnergyMeter:
             started=data.get("started"),
             odometer_at_start_km=data.get("odometer_at_start_km"),
             api_wh_per_km_at_start=data.get("api_wh_per_km_at_start"),
+            started_at=data.get("started_at"),
+            baseline_rows=(
+                {str(k): float(v) for k, v in baseline.items()}
+                if (baseline := data.get("baseline_rows")) is not None
+                else None
+            ),
+            backfilled=bool(data.get("backfilled", False)),
         )
+
+
+def backfill_statistics(
+    meter: DrivingEnergyMeter, tz: tzinfo
+) -> list[tuple[datetime, float]]:
+    """Return ``(hour start, sum in Wh)`` rows for the days before the meter.
+
+    The API only gives per-day totals, so each day is placed at 12:00 local
+    time. Sums are rebased to end at 0, the meter's zero point in statistics,
+    and every row lies strictly before the meter's first state: importing
+    over hours the recorder already compiled would break the sum chain.
+    """
+    if not meter.initialized or meter.started is None:
+        return []
+    if meter.baseline_rows is not None:
+        days = dict(meter.baseline_rows)
+    else:
+        # Meters started before baseline rows were stored: only days before
+        # the start date are certainly free of energy the meter counted.
+        days = {k: v for k, v in meter.rows.items() if k < meter.started}
+    latest_hour: datetime | None = None
+    if meter.started_at is not None:
+        started_at = datetime.fromisoformat(meter.started_at).astimezone(tz)
+        latest_hour = started_at.replace(minute=0, second=0, microsecond=0) - (
+            timedelta(hours=1)
+        )
+    placed: list[tuple[datetime, float]] = []
+    for key in sorted(days):
+        start = datetime.combine(date.fromisoformat(key), time(12), tz)
+        if latest_hour is not None and start > latest_hour:
+            start = latest_hour
+        elif latest_hour is None and key >= meter.started:
+            continue
+        if placed and start <= placed[-1][0]:
+            # Two days in the same hour: merge into the earlier row.
+            placed[-1] = (placed[-1][0], placed[-1][1] + days[key])
+            continue
+        placed.append((start, days[key]))
+    total = sum(wh for _, wh in placed)
+    result: list[tuple[datetime, float]] = []
+    running = 0.0
+    for start, wh in placed:
+        running += wh
+        result.append((start, running - total))
+    return result
 
 
 def daily_rows(vehicle: Vehicle) -> dict[date, float] | None:
@@ -154,12 +216,12 @@ class DrivingEnergyTracker:
         self,
         store: MeterStore,
         vehicle: Vehicle,
-        today: Callable[[], date],
+        now: Callable[[], datetime],
     ) -> None:
         """Initialize the tracker."""
         self._store = store
         self._vehicle = vehicle
-        self._today = today
+        self._now = now
         self._lock = asyncio.Lock()
         self._listeners: list[Callable[[], None]] = []
         self.meter: DrivingEnergyMeter | None = None
@@ -177,11 +239,13 @@ class DrivingEnergyTracker:
             if self.meter is None:
                 return
             updated = copy.deepcopy(self.meter)
+            now = self._now()
             if not updated.update(
                 daily_rows(self._vehicle),
-                self._today(),
+                now.date(),
                 odometer_km(self._vehicle),
                 self._vehicle.power_consumption_30d,
+                now,
             ):
                 return
             # Persist first: a crash after publishing but before saving would
@@ -190,6 +254,16 @@ class DrivingEnergyTracker:
             self.meter = updated
         for listener in list(self._listeners):
             listener()
+
+    async def async_mark_backfilled(self) -> None:
+        """Record that the pre-meter days were imported into statistics."""
+        async with self._lock:
+            if self.meter is None:
+                return
+            updated = copy.deepcopy(self.meter)
+            updated.backfilled = True
+            await self._store.async_save(updated.as_dict())
+            self.meter = updated
 
     def add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
         """Call ``listener`` after each published change; return a remover."""

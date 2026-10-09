@@ -1,7 +1,9 @@
 """Tests for the statistics-safe driving energy meter."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
+from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.sensor import SensorStateClass
@@ -13,10 +15,13 @@ from custom_components.kia_uvo.const import CONF_LIFETIME_AVERAGE_CONSUMPTION
 from custom_components.kia_uvo.driving_energy import (
     DrivingEnergyMeter,
     DrivingEnergyTracker,
+    backfill_statistics,
 )
 from tests.conftest import make_coordinator, make_hass
 
 TODAY = date(2026, 10, 8)
+TZ = ZoneInfo("Europe/Brussels")
+NOW = datetime(2026, 10, 8, 21, 7, tzinfo=TZ)
 
 
 def rows(**days: float) -> dict[date, float]:
@@ -137,7 +142,7 @@ def ev(day_rows: dict[date, float] | None) -> Vehicle:
 async def test_tracker_saves_before_publishing() -> None:
     store = FakeStore()
     vehicle = ev(rows(d20261006=13089))
-    tracker = DrivingEnergyTracker(store, vehicle, lambda: TODAY)
+    tracker = DrivingEnergyTracker(store, vehicle, lambda: NOW)
     await tracker.async_load()
     await tracker.async_process()
 
@@ -160,12 +165,12 @@ async def test_tracker_saves_before_publishing() -> None:
 
 async def test_tracker_resumes_from_store() -> None:
     store = FakeStore()
-    tracker = DrivingEnergyTracker(store, ev(rows(d20261006=13089)), lambda: TODAY)
+    tracker = DrivingEnergyTracker(store, ev(rows(d20261006=13089)), lambda: NOW)
     await tracker.async_load()
     await tracker.async_process()
 
     vehicle = ev(rows(d20261006=13089, d20261008=13238))
-    resumed = DrivingEnergyTracker(store, vehicle, lambda: TODAY)
+    resumed = DrivingEnergyTracker(store, vehicle, lambda: NOW)
     await resumed.async_load()
     await resumed.async_process()
     assert resumed.meter is not None
@@ -195,3 +200,96 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
         and entity.entity_description.key == "total_power_consumed"
     )
     assert window.state_class is None
+
+
+def test_backfill_ends_at_zero_before_first_state() -> None:
+    meter = DrivingEnergyMeter()
+    meter.update(
+        rows(d20261005=26762, d20261006=25516, d20261008=19465),
+        TODAY,
+        50905.3,
+        158.0,
+        NOW,
+    )
+    imported = backfill_statistics(meter, TZ)
+    assert [start for start, _ in imported] == [
+        datetime(2026, 10, 5, 12, tzinfo=TZ),
+        datetime(2026, 10, 6, 12, tzinfo=TZ),
+        datetime(2026, 10, 8, 12, tzinfo=TZ),
+    ]
+    assert [wh for _, wh in imported] == [-44981, -19465, 0]
+    first_state_hour = NOW.replace(minute=0)
+    assert all(start + timedelta(hours=1) <= first_state_hour for start, _ in imported)
+
+
+def test_backfill_moves_start_day_before_a_morning_install() -> None:
+    meter = DrivingEnergyMeter()
+    morning = datetime(2026, 10, 8, 9, 30, tzinfo=TZ)
+    meter.update(rows(d20261008=500), TODAY, None, None, morning)
+    # The last full hour before the meter's first state.
+    assert backfill_statistics(meter, TZ) == [
+        (datetime(2026, 10, 8, 8, tzinfo=TZ), 0.0)
+    ]
+
+
+def test_backfill_for_meter_started_without_baseline_rows() -> None:
+    # Stores written before baseline rows existed: only days before the
+    # start date, since later deltas may already be in the meter.
+    meter = DrivingEnergyMeter.from_dict(
+        {
+            "total_wh": 1500.0,
+            "rows": {"2026-10-06": 25516, "2026-10-08": 20965},
+            "started": "2026-10-08",
+        }
+    )
+    assert backfill_statistics(meter, TZ) == [
+        (datetime(2026, 10, 6, 12, tzinfo=TZ), 0.0)
+    ]
+
+
+def test_backfill_needs_a_started_meter() -> None:
+    assert backfill_statistics(DrivingEnergyMeter(), TZ) == []
+
+
+async def test_tracker_marks_backfilled() -> None:
+    store = FakeStore()
+    tracker = DrivingEnergyTracker(store, ev(rows(d20261006=13089)), lambda: NOW)
+    await tracker.async_load()
+    await tracker.async_process()
+    await tracker.async_mark_backfilled()
+    assert store.data is not None and store.data["backfilled"] is True
+    assert store.data["baseline_rows"] == {"2026-10-06": 13089}
+
+
+async def test_sensor_imports_backfill_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from homeassistant.components.recorder import statistics as recorder_statistics
+
+    imported: list[tuple[Any, list[Any]]] = []
+    monkeypatch.setattr(
+        recorder_statistics,
+        "async_import_statistics",
+        lambda hass, metadata, stats: imported.append((metadata, list(stats))),
+    )
+    monkeypatch.setattr(sensor_platform, "Store", FakeStoreType)
+    vehicle = ev(rows(d20261005=26762, d20261006=13089))
+    hass, config_entry = make_hass(make_coordinator(vehicle))
+    config_entry.options = {}
+    created: list[Any] = []
+    await sensor_platform.async_setup_entry(hass, config_entry, created.extend)
+    meter = next(e for e in created if type(e).__name__ == "DrivingEnergySensor")
+    meter.hass = MagicMock()
+    meter.hass.config.components = {"recorder"}
+    meter.entity_id = "sensor.ev6_driving_energy"
+    monkeypatch.setattr(
+        type(meter), "unit_of_measurement", property(lambda self: "kWh")
+    )
+
+    await meter._async_backfill()
+    await meter._async_backfill()
+
+    assert len(imported) == 1
+    metadata, stats = imported[0]
+    assert metadata["statistic_id"] == "sensor.ev6_driving_energy"
+    assert metadata["source"] == "recorder"
+    assert metadata["unit_of_measurement"] == "kWh"
+    assert [s["sum"] for s in stats] == [pytest.approx(-13.089), 0.0]
