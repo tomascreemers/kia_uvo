@@ -1,19 +1,30 @@
-"""Lifetime driving energy meter for Home Assistant statistics.
+"""Lifetime driving energy and distance meters for Home Assistant statistics.
 
 The EU ``drvhistory`` endpoint only returns rolling windows: one row per
 driving day for about 30 days, and a 90-day total. Neither can feed Home
 Assistant's long-term statistics directly, because a rolling window shrinks
-as old days drop out. This module turns the daily rows into a meter that
-only moves when driving energy is added (or, rarely, corrected): every poll
-adds the change of each day's row since the previous poll.
+as old days drop out. This module turns the daily rows into meters that only
+move when driving is reported (or, rarely, corrected): every poll applies the
+change of each day's row since the previous poll.
+
+The car uploads its trips on its own, sometimes days late: a forced refresh
+does not make it. A change to today's row moves the meter, so it lands in the
+hour it is reported. A change to an earlier day's row is kept apart as
+``late`` until the sensor has added it to that day's statistics, so the
+energy and distance show up on the day they were driven.
 
 Rows are forgotten by age, never because a response lacked them. The library
 reports no rows when the endpoint returns nothing usable, and forgetting rows
 then would count all 30 days again once they come back.
 
-The rows seen when the meter starts are not counted by the meter itself;
+The rows seen when a meter starts are not counted by the meter itself;
 ``backfill_statistics`` turns them into hourly statistics placed before the
 meter's first state, so the ~30 days before installation still show up.
+
+Home Assistant computes the change of the first statistics row against 0,
+so the imported sums start at 0 and end at the imported total. The recorder
+continues the sum from the sensor's last short-term row, so the sensor shifts
+the rows compiled since the meter started up by that total.
 """
 
 from __future__ import annotations
@@ -23,7 +34,7 @@ import copy
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta, tzinfo
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import LENGTH_MILES
@@ -32,46 +43,69 @@ from hyundai_kia_connect_api.const import LENGTH_MILES
 # while the API can still revise it.
 ROW_RETENTION = timedelta(days=35)
 KM_PER_MILE = 1.609344
+# Days before the meter: the hour backfill_statistics put them in.
+BACKFILL_HOUR = time(12)
+# Days since the meter: the API gives no time, and a late change is driving
+# after the last report of that day, so book it in the day's last hour.
+LATE_HOUR = time(23)
+# 1: imported sums ended at 0, so the first imported day had a negative
+# change. 2: imported sums start at 0, compiled rows shifted up.
+BACKFILL_VERSION = 2
+
+Quantity = Literal["energy", "distance"]
 
 
 @dataclass
-class DrivingEnergyMeter:
-    """Accumulated driving energy (Wh) and the daily rows it was built from."""
+class DailyTotal:
+    """A total of one quantity, built from the change of its daily rows.
 
-    total_wh: float = 0.0
+    ``total`` counts changes to the current day's row; it is the sensor state.
+    ``late`` holds changes to earlier days until they are added to those
+    days' statistics, after which they count in ``backdated``.
+    """
+
+    total: float = 0.0
     rows: dict[str, float] = field(default_factory=dict)
     started: str | None = None
-    odometer_at_start_km: float | None = None
-    api_wh_per_km_at_start: float | None = None
     started_at: str | None = None
     baseline_rows: dict[str, float] | None = None
-    backfilled: bool = False
+    backfill_version: int = 0
+    late: dict[str, float] = field(default_factory=dict)
+    backdated: float = 0.0
 
     @property
     def initialized(self) -> bool:
         """Return True once a first set of daily rows has been seen."""
         return self.started is not None
 
+    @property
+    def backfilled(self) -> bool:
+        """Return True once the days before the start are in statistics."""
+        return self.backfill_version >= BACKFILL_VERSION
+
+    @property
+    def measured(self) -> float:
+        """Return everything counted since the start, wherever it is booked."""
+        return self.total + self.backdated + sum(self.late.values())
+
     def update(
         self,
         rows: Mapping[date, float] | None,
         today: date,
-        odometer_km: float | None = None,
-        api_wh_per_km: float | None = None,
         now: datetime | None = None,
     ) -> bool:
         """Apply the latest daily rows; return True if anything changed.
 
-        The first non-empty set of rows only sets the baseline: energy driven
-        before the meter existed is not booked as new consumption.
+        The first non-empty set of rows only sets the baseline: driving
+        before the meter existed is not booked as new.
         """
         if not rows:
             # No information: keep everything as it is.
             return False
         cutoff = (today - ROW_RETENTION).isoformat()
         latest = {
-            day.isoformat(): float(wh)
-            for day, wh in rows.items()
+            day.isoformat(): float(value)
+            for day, value in rows.items()
             if day.isoformat() >= cutoff
         }
         changed = False
@@ -80,21 +114,97 @@ class DrivingEnergyMeter:
             self.baseline_rows = dict(latest)
             self.started = today.isoformat()
             self.started_at = now.isoformat() if now is not None else None
-            self.odometer_at_start_km = odometer_km
-            self.api_wh_per_km_at_start = api_wh_per_km
             changed = True
         else:
-            for key, wh in latest.items():
-                delta = wh - self.rows.get(key, 0.0)
+            today_key = today.isoformat()
+            for key, value in latest.items():
+                delta = value - self.rows.get(key, 0.0)
                 if delta or key not in self.rows:
-                    self.total_wh += delta
-                    self.rows[key] = wh
+                    if key < today_key:
+                        self.late[key] = self.late.get(key, 0.0) + delta
+                    else:
+                        self.total += delta
+                    self.rows[key] = value
                     changed = True
-        kept = {key: wh for key, wh in self.rows.items() if key >= cutoff}
+        kept = {key: value for key, value in self.rows.items() if key >= cutoff}
         if len(kept) != len(self.rows):
             self.rows = kept
             changed = True
         return changed
+
+    def mark_backdated(self, applied: Mapping[str, float]) -> None:
+        """Record that ``applied`` late changes were added to statistics."""
+        for key, value in applied.items():
+            remaining = self.late.get(key, 0.0) - value
+            if abs(remaining) < 1e-9:
+                self.late.pop(key, None)
+            else:
+                self.late[key] = remaining
+            self.backdated += value
+
+    def late_hour(self, key: str, tz: tzinfo) -> datetime:
+        """Return the statistics hour a late change to day ``key`` belongs in."""
+        day = date.fromisoformat(key)
+        if self.started is not None and key < self.started:
+            return datetime.combine(day, BACKFILL_HOUR, tz)
+        return datetime.combine(day, LATE_HOUR, tz)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DailyTotal:
+        """Build a total from ``asdict`` output."""
+        return cls(
+            total=float(data.get("total", 0.0)),
+            rows=_float_rows(data.get("rows", {})),
+            started=data.get("started"),
+            started_at=data.get("started_at"),
+            baseline_rows=(
+                _float_rows(baseline)
+                if (baseline := data.get("baseline_rows")) is not None
+                else None
+            ),
+            backfill_version=int(
+                data.get("backfill_version", 1 if data.get("backfilled") else 0)
+            ),
+            late=_float_rows(data.get("late", {})),
+            backdated=float(data.get("backdated", 0.0)),
+        )
+
+
+def _float_rows(rows: Mapping[Any, Any]) -> dict[str, float]:
+    return {str(k): float(v) for k, v in rows.items()}
+
+
+@dataclass
+class DrivingMeter:
+    """Driving energy (Wh) and distance (km) totals of one vehicle."""
+
+    energy: DailyTotal = field(default_factory=DailyTotal)
+    distance: DailyTotal = field(default_factory=DailyTotal)
+    odometer_at_start_km: float | None = None
+    api_wh_per_km_at_start: float | None = None
+
+    @property
+    def initialized(self) -> bool:
+        """Return True once the energy total has started."""
+        return self.energy.initialized
+
+    def update(
+        self,
+        energy_rows: Mapping[date, float] | None,
+        distance_rows: Mapping[date, float] | None,
+        today: date,
+        odometer_km: float | None = None,
+        api_wh_per_km: float | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Apply the latest daily rows; return True if anything changed."""
+        starting = not self.energy.initialized
+        changed = self.energy.update(energy_rows, today, now)
+        if starting and self.energy.initialized:
+            self.odometer_at_start_km = odometer_km
+            self.api_wh_per_km_at_start = api_wh_per_km
+        # Not short-circuited: both totals must see every poll.
+        return self.distance.update(distance_rows, today, now) or changed
 
     def lifetime_estimate_wh(self, wh_per_km: float | None) -> float | None:
         """Estimate lifetime driving energy: start odometer x average + measured."""
@@ -106,78 +216,88 @@ class DrivingEnergyMeter:
             or wh_per_km is None
         ):
             return None
-        return self.odometer_at_start_km * wh_per_km + self.total_wh
+        return self.odometer_at_start_km * wh_per_km + self.energy.measured
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation."""
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> DrivingEnergyMeter:
-        """Build a meter from ``as_dict`` output."""
+    def from_dict(cls, data: Mapping[str, Any]) -> DrivingMeter:
+        """Build a meter from ``as_dict`` output, or from the energy-only format.
+
+        The energy-only format kept energy at the top level, as ``total_wh``.
+        Its total included late changes; they stay where they were booked.
+        """
+        if "energy" in data:
+            energy = DailyTotal.from_dict(data["energy"])
+            distance = DailyTotal.from_dict(data.get("distance", {}))
+        else:
+            energy = DailyTotal.from_dict({**data, "total": data.get("total_wh", 0.0)})
+            distance = DailyTotal()
         return cls(
-            total_wh=float(data.get("total_wh", 0.0)),
-            rows={str(k): float(v) for k, v in data.get("rows", {}).items()},
-            started=data.get("started"),
+            energy=energy,
+            distance=distance,
             odometer_at_start_km=data.get("odometer_at_start_km"),
             api_wh_per_km_at_start=data.get("api_wh_per_km_at_start"),
-            started_at=data.get("started_at"),
-            baseline_rows=(
-                {str(k): float(v) for k, v in baseline.items()}
-                if (baseline := data.get("baseline_rows")) is not None
-                else None
-            ),
-            backfilled=bool(data.get("backfilled", False)),
         )
 
 
-def backfill_statistics(
-    meter: DrivingEnergyMeter, tz: tzinfo
-) -> list[tuple[datetime, float]]:
-    """Return ``(hour start, sum in Wh)`` rows for the days before the meter.
+@dataclass
+class Backfill:
+    """Hourly statistics for the days before a meter started."""
+
+    # (hour start, sum) rows; sums run from the first day's value up to total.
+    rows: list[tuple[datetime, float]]
+    total: float
+    # The first hour the recorder compiles for the meter.
+    meter_start: datetime
+
+
+def backfill_statistics(total: DailyTotal, tz: tzinfo) -> Backfill | None:
+    """Return statistics for the days before the meter, or None if unstarted.
 
     The API only gives per-day totals, so each day is placed at 12:00 local
-    time. Sums are rebased to end at 0, the meter's zero point in statistics,
-    and every row lies strictly before the meter's first state: importing
+    time. Every row lies strictly before the meter's first state: importing
     over hours the recorder already compiled would break the sum chain.
     """
-    if not meter.initialized or meter.started is None:
-        return []
-    if meter.baseline_rows is not None:
-        days = dict(meter.baseline_rows)
+    if not total.initialized or total.started is None:
+        return None
+    if total.baseline_rows is not None:
+        days = dict(total.baseline_rows)
     else:
         # Meters started before baseline rows were stored: only days before
         # the start date are certainly free of energy the meter counted.
-        days = {k: v for k, v in meter.rows.items() if k < meter.started}
+        days = {k: v for k, v in total.rows.items() if k < total.started}
     latest_hour: datetime | None = None
-    if meter.started_at is not None:
-        started_at = datetime.fromisoformat(meter.started_at).astimezone(tz)
-        latest_hour = started_at.replace(minute=0, second=0, microsecond=0) - (
-            timedelta(hours=1)
-        )
+    if total.started_at is not None:
+        started_at = datetime.fromisoformat(total.started_at).astimezone(tz)
+        meter_start = started_at.replace(minute=0, second=0, microsecond=0)
+        latest_hour = meter_start - timedelta(hours=1)
+    else:
+        meter_start = datetime.combine(date.fromisoformat(total.started), time(), tz)
     placed: list[tuple[datetime, float]] = []
     for key in sorted(days):
-        start = datetime.combine(date.fromisoformat(key), time(12), tz)
+        start = datetime.combine(date.fromisoformat(key), BACKFILL_HOUR, tz)
         if latest_hour is not None and start > latest_hour:
             start = latest_hour
-        elif latest_hour is None and key >= meter.started:
+        elif latest_hour is None and key >= total.started:
             continue
         if placed and start <= placed[-1][0]:
             # Two days in the same hour: merge into the earlier row.
             placed[-1] = (placed[-1][0], placed[-1][1] + days[key])
             continue
         placed.append((start, days[key]))
-    total = sum(wh for _, wh in placed)
-    result: list[tuple[datetime, float]] = []
+    rows: list[tuple[datetime, float]] = []
     running = 0.0
-    for start, wh in placed:
-        running += wh
-        result.append((start, running - total))
-    return result
+    for start, value in placed:
+        running += value
+        rows.append((start, running))
+    return Backfill(rows, running, meter_start)
 
 
 def daily_rows(vehicle: Vehicle) -> dict[date, float] | None:
-    """Return the vehicle's daily driving energy rows keyed by date."""
+    """Return the vehicle's daily driving energy rows (Wh) keyed by date."""
     stats = vehicle.daily_stats
     if not stats:
         return None
@@ -186,6 +306,22 @@ def daily_rows(vehicle: Vehicle) -> dict[date, float] | None:
         if day.date is None or day.total_consumed is None:
             continue
         rows[day.date.date()] = float(day.total_consumed)
+    return rows or None
+
+
+def daily_distance_rows(vehicle: Vehicle) -> dict[date, float] | None:
+    """Return the vehicle's daily driving distance rows (km) keyed by date."""
+    stats = vehicle.daily_stats
+    if not stats:
+        return None
+    rows: dict[date, float] = {}
+    for day in stats:
+        if day.date is None or day.distance is None:
+            continue
+        km = float(day.distance)
+        if day.distance_unit == LENGTH_MILES:
+            km *= KM_PER_MILE
+        rows[day.date.date()] = km
     return rows or None
 
 
@@ -209,7 +345,7 @@ class MeterStore(Protocol):
         """Save data."""
 
 
-class DrivingEnergyTracker:
+class DrivingMeterTracker:
     """Keep one vehicle's meter in sync with coordinator updates."""
 
     def __init__(
@@ -224,46 +360,63 @@ class DrivingEnergyTracker:
         self._now = now
         self._lock = asyncio.Lock()
         self._listeners: list[Callable[[], None]] = []
-        self.meter: DrivingEnergyMeter | None = None
+        self.meter: DrivingMeter | None = None
 
     async def async_load(self) -> None:
         """Load the persisted meter."""
         data = await self._store.async_load()
-        self.meter = (
-            DrivingEnergyMeter.from_dict(data) if data else DrivingEnergyMeter()
-        )
+        self.meter = DrivingMeter.from_dict(data) if data else DrivingMeter()
 
     async def async_process(self) -> None:
         """Apply the vehicle's current rows; save before publishing."""
-        async with self._lock:
-            if self.meter is None:
-                return
-            updated = copy.deepcopy(self.meter)
-            now = self._now()
-            if not updated.update(
+        now = self._now()
+        if not await self._async_change(
+            lambda meter: meter.update(
                 daily_rows(self._vehicle),
+                daily_distance_rows(self._vehicle),
                 now.date(),
                 odometer_km(self._vehicle),
                 self._vehicle.power_consumption_30d,
                 now,
-            ):
-                return
+            )
+        ):
+            return
+        for listener in list(self._listeners):
+            listener()
+
+    async def async_mark_backfilled(self, quantity: Quantity) -> None:
+        """Record that the days before ``quantity``'s start were imported."""
+
+        def mark(meter: DrivingMeter) -> bool:
+            getattr(meter, quantity).backfill_version = BACKFILL_VERSION
+            return True
+
+        await self._async_change(mark)
+
+    async def async_mark_backdated(
+        self, quantity: Quantity, applied: Mapping[str, float]
+    ) -> None:
+        """Record that ``applied`` late changes were added to statistics."""
+
+        def mark(meter: DrivingMeter) -> bool:
+            getattr(meter, quantity).mark_backdated(applied)
+            return True
+
+        await self._async_change(mark)
+
+    async def _async_change(self, change: Callable[[DrivingMeter], bool]) -> bool:
+        """Apply ``change`` to a copy; save, then keep it if it changed."""
+        async with self._lock:
+            if self.meter is None:
+                return False
+            updated = copy.deepcopy(self.meter)
+            if not change(updated):
+                return False
             # Persist first: a crash after publishing but before saving would
             # restore a lower total, which statistics book as negative usage.
             await self._store.async_save(updated.as_dict())
             self.meter = updated
-        for listener in list(self._listeners):
-            listener()
-
-    async def async_mark_backfilled(self) -> None:
-        """Record that the pre-meter days were imported into statistics."""
-        async with self._lock:
-            if self.meter is None:
-                return
-            updated = copy.deepcopy(self.meter)
-            updated.backfilled = True
-            await self._store.async_save(updated.as_dict())
-            self.meter = updated
+            return True
 
     def add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
         """Call ``listener`` after each published change; return a remover."""

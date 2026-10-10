@@ -417,6 +417,9 @@
       "data": {
         "name": "Data"
       },
+      "driving_distance": {
+        "name": "Driving Distance"
+      },
       "driving_energy": {
         "name": "Driving Energy"
       },

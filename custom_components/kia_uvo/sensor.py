@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from homeassistant.const import (
     EntityCategory,
     UnitOfElectricPotential,
     UnitOfEnergy,
+    UnitOfLength,
     UnitOfPower,
     UnitOfTime,
 )
@@ -29,7 +31,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import StateType
 from homeassistant.util import dt as dt_util
-from homeassistant.util.unit_conversion import EnergyConverter
+from homeassistant.util.unit_conversion import (
+    BaseUnitConverter,
+    DistanceConverter,
+    EnergyConverter,
+)
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import ENGINE_TYPES
 
@@ -40,7 +46,12 @@ from .const import (
     DYNAMIC_UNIT,
 )
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
-from .driving_energy import DrivingEnergyTracker, backfill_statistics
+from .driving_energy import (
+    DailyTotal,
+    DrivingMeterTracker,
+    Quantity,
+    backfill_statistics,
+)
 from .entity import HyundaiKiaConnectEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -624,8 +635,8 @@ async def _async_driving_energy_entities(
     coordinator: HyundaiKiaConnectDataUpdateCoordinator,
     vehicle: Vehicle,
 ) -> list[SensorEntity]:
-    """Set up the driving energy meter and its lifetime estimate."""
-    tracker = DrivingEnergyTracker(
+    """Set up the driving energy and distance meters and the lifetime estimate."""
+    tracker = DrivingMeterTracker(
         Store[dict[str, Any]](
             hass,
             DRIVING_ENERGY_STORAGE_VERSION,
@@ -647,6 +658,7 @@ async def _async_driving_energy_entities(
     average: float | None = config_entry.options.get(CONF_LIFETIME_AVERAGE_CONSUMPTION)
     return [
         DrivingEnergySensor(coordinator, vehicle, tracker),
+        DrivingDistanceSensor(coordinator, vehicle, tracker),
         LifetimeDrivingEnergyEstimateSensor(
             coordinator,
             vehicle,
@@ -657,60 +669,115 @@ async def _async_driving_energy_entities(
     ]
 
 
-class DrivingEnergySensor(SensorEntity, HyundaiKiaConnectEntity):
-    """Driving energy measured since the meter started, for statistics.
+class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
+    """A total built from the daily driving rows, for statistics.
 
-    Each poll adds the change of every daily row, so energy lands in the hour
-    it is first reported, and late corrections to earlier days still count.
+    A change to the current day's row moves the state, so it lands in the
+    hour it is reported. A change to an earlier day goes straight into that
+    day's statistics instead, so it shows up on the day it was driven. The
+    state leaves it out: the recorder would otherwise book it again now.
     """
 
-    _attr_translation_key = "driving_energy"
-    _attr_icon = "mdi:car-electric"
-    _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL
-    _attr_native_unit_of_measurement = UnitOfEnergy.WATT_HOUR
-    _attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    _attr_suggested_display_precision = 2
+    _quantity: Quantity
+    _converter: type[BaseUnitConverter]
+    _native_unit: str
 
     def __init__(
         self,
         coordinator: HyundaiKiaConnectDataUpdateCoordinator,
         vehicle: Vehicle,
-        tracker: DrivingEnergyTracker,
+        tracker: DrivingMeterTracker,
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, vehicle)
         self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_driving_energy"
+        self._statistics_lock = asyncio.Lock()
+        self._attr_native_unit_of_measurement = self._native_unit
+        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_driving_{self._quantity}"
+
+    def _total(self) -> DailyTotal | None:
+        """Return this sensor's total, or None until it has started."""
+        meter = self._tracker.meter
+        if meter is None:
+            return None
+        total: DailyTotal = getattr(meter, self._quantity)
+        return total if total.initialized else None
 
     async def async_added_to_hass(self) -> None:
         """Publish whenever the tracker has saved a change."""
         await super().async_added_to_hass()
         self.async_on_remove(self._tracker.add_listener(self._handle_meter_change))
-        await self._async_backfill()
+        await self._async_update_statistics()
 
     @callback
     def _handle_meter_change(self) -> None:
         self.async_write_ha_state()
-        meter = self._tracker.meter
-        if meter is not None and meter.initialized and not meter.backfilled:
+        self._schedule_statistics_update()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        super()._handle_coordinator_update()
+        # Retries statistics work that waited for the recorder.
+        self._schedule_statistics_update()
+
+    @callback
+    def _schedule_statistics_update(self) -> None:
+        total = self._total()
+        if total is not None and (not total.backfilled or total.late):
             self.hass.async_create_task(
-                self._async_backfill(), f"{DOMAIN} driving energy backfill"
+                self._async_update_statistics(),
+                f"{DOMAIN} driving {self._quantity} statistics",
             )
 
-    async def _async_backfill(self) -> None:
-        """Import the days before the meter started, once.
+    async def _async_update_statistics(self) -> None:
+        """Import the days before the meter once, then move in late changes.
 
-        They go into this sensor's own statistics, strictly before its first
-        state and with sums ending at the zero point, so the chain the
-        recorder compiles afterwards continues unchanged.
+        Both go into this sensor's own statistics, as changes to the sums
+        from a given hour onwards. The recorder continues the sum from the
+        sensor's last short-term statistics, so this waits until it has
+        compiled some: a change made before then would be lost at the next
+        compile. The recorder runs its jobs in order, so each change lands on
+        top of the previous ones.
         """
-        meter = self._tracker.meter
-        if meter is None or not meter.initialized or meter.backfilled:
-            return
         if "recorder" not in self.hass.config.components:
             return
-        # Imported lazily: the recorder is only needed for this one-off job.
+        async with self._statistics_lock:
+            total = self._total()
+            if total is None or (total.backfilled and not total.late):
+                return
+            if not await self._async_has_short_term_statistics():
+                return
+            if not total.backfilled:
+                self._import_backfill(total)
+                await self._tracker.async_mark_backfilled(self._quantity)
+            if total.late:
+                applied = dict(total.late)
+                self._adjust_late(total, applied)
+                await self._tracker.async_mark_backdated(self._quantity, applied)
+
+    async def _async_has_short_term_statistics(self) -> bool:
+        from homeassistant.components.recorder.statistics import (
+            get_last_short_term_statistics,
+        )
+        from homeassistant.helpers.recorder import get_instance
+
+        last = await get_instance(self.hass).async_add_executor_job(
+            get_last_short_term_statistics,
+            self.hass,
+            1,
+            self.entity_id,
+            False,
+            {"sum"},
+        )
+        return bool(last.get(self.entity_id))
+
+    def _import_backfill(self, total: DailyTotal) -> None:
+        """Import the days before the meter and shift the compiled sums.
+
+        Re-importing replaces rows of an earlier import at the same hours.
+        """
+        # Imported lazily: the recorder is only needed for statistics jobs.
         from homeassistant.components.recorder.models import (
             StatisticData,
             StatisticMeanType,
@@ -719,44 +786,108 @@ class DrivingEnergySensor(SensorEntity, HyundaiKiaConnectEntity):
         from homeassistant.components.recorder.statistics import (
             async_import_statistics,
         )
+        from homeassistant.helpers.recorder import get_instance
 
-        unit = self.unit_of_measurement or UnitOfEnergy.WATT_HOUR
-        rows = backfill_statistics(meter, dt_util.get_default_time_zone())
-        if rows:
-            metadata: StatisticMetaData = {
-                "mean_type": StatisticMeanType.NONE,
-                "has_sum": True,
-                "name": None,
-                "source": "recorder",
-                "statistic_id": self.entity_id,
-                "unit_class": EnergyConverter.UNIT_CLASS,
-                "unit_of_measurement": unit,
+        backfill = backfill_statistics(total, dt_util.get_default_time_zone())
+        if backfill is None or not backfill.rows:
+            return
+        unit = self.unit_of_measurement or self._native_unit
+        metadata: StatisticMetaData = {
+            "mean_type": StatisticMeanType.NONE,
+            "has_sum": True,
+            "name": None,
+            "source": "recorder",
+            "statistic_id": self.entity_id,
+            "unit_class": self._converter.UNIT_CLASS,
+            "unit_of_measurement": unit,
+        }
+        statistics: list[StatisticData] = [
+            {
+                "start": start,
+                "sum": self._converter.convert(value, self._native_unit, unit),
             }
-            statistics: list[StatisticData] = [
-                {
-                    "start": start,
-                    "sum": EnergyConverter.convert(
-                        wh_sum, UnitOfEnergy.WATT_HOUR, unit
-                    ),
-                }
-                for start, wh_sum in rows
-            ]
-            async_import_statistics(self.hass, metadata, statistics)
+            for start, value in backfill.rows
+        ]
+        async_import_statistics(self.hass, metadata, statistics)
+        get_instance(self.hass).async_adjust_statistics(
+            self.entity_id, backfill.meter_start, backfill.total, self._native_unit
+        )
+        _LOGGER.info(
+            "Imported %d days of driving %s before %s into %s",
+            len(backfill.rows),
+            self._quantity,
+            total.started_at or total.started,
+            self.entity_id,
+        )
+
+    def _adjust_late(self, total: DailyTotal, late: dict[str, float]) -> None:
+        from homeassistant.helpers.recorder import get_instance
+
+        recorder = get_instance(self.hass)
+        tz = dt_util.get_default_time_zone()
+        for key, value in sorted(late.items()):
+            hour = total.late_hour(key, tz)
+            recorder.async_adjust_statistics(
+                self.entity_id, hour, value, self._native_unit
+            )
             _LOGGER.info(
-                "Imported %d days of driving energy before %s into %s",
-                len(rows),
-                meter.started_at or meter.started,
+                "Booked %s %s of driving %s reported late for %s at %s in %s",
+                value,
+                self._native_unit,
+                self._quantity,
+                key,
+                hour.isoformat(),
                 self.entity_id,
             )
-        await self._tracker.async_mark_backfilled()
 
     @property
     def native_value(self) -> float | None:
-        """Return the measured energy, or None until the meter has started."""
-        meter = self._tracker.meter
-        if meter is None or not meter.initialized:
-            return None
-        return meter.total_wh
+        """Return the current-day total, or None until the meter has started."""
+        total = self._total()
+        return total.total if total is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return what was booked outside the state."""
+        total = self._total()
+        if total is None:
+            return {}
+        return {
+            "measured_since": total.started,
+            f"booked_on_earlier_days_{self._native_unit.lower()}": round(
+                total.backdated + sum(total.late.values()), 3
+            ),
+        }
+
+
+class DrivingEnergySensor(DrivingTotalSensor):
+    """Driving energy measured since the meter started, for statistics."""
+
+    _attr_translation_key = "driving_energy"
+    _attr_icon = "mdi:car-electric"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 2
+    _quantity = "energy"
+    _converter = EnergyConverter
+    _native_unit = UnitOfEnergy.WATT_HOUR
+
+
+class DrivingDistanceSensor(DrivingTotalSensor):
+    """Driving distance measured since the meter started, for statistics.
+
+    Built from the same daily rows as the energy, so both cover the same
+    trips and are booked on the same days. The API reports whole kilometres
+    per day.
+    """
+
+    _attr_translation_key = "driving_distance"
+    _attr_icon = "mdi:map-marker-distance"
+    _attr_device_class = SensorDeviceClass.DISTANCE
+    _attr_suggested_display_precision = 0
+    _quantity = "distance"
+    _converter = DistanceConverter
+    _native_unit = UnitOfLength.KILOMETERS
 
 
 class LifetimeDrivingEnergyEstimateSensor(SensorEntity, HyundaiKiaConnectEntity):
@@ -778,7 +909,7 @@ class LifetimeDrivingEnergyEstimateSensor(SensorEntity, HyundaiKiaConnectEntity)
         self,
         coordinator: HyundaiKiaConnectDataUpdateCoordinator,
         vehicle: Vehicle,
-        tracker: DrivingEnergyTracker,
+        tracker: DrivingMeterTracker,
         wh_per_km: float | None,
     ) -> None:
         """Initialize the sensor."""
@@ -808,7 +939,7 @@ class LifetimeDrivingEnergyEstimateSensor(SensorEntity, HyundaiKiaConnectEntity)
             return {}
         wh_per_km = self._wh_per_km or meter.api_wh_per_km_at_start
         return {
-            "measured_since": meter.started,
+            "measured_since": meter.energy.started,
             "odometer_at_start_km": meter.odometer_at_start_km,
             "average_consumption_kwh_per_100km": (
                 round(wh_per_km / 10, 2) if wh_per_km is not None else None
