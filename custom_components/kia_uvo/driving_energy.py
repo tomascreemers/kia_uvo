@@ -25,12 +25,18 @@ Home Assistant computes the change of the first statistics row against 0,
 so the imported sums start at 0 and end at the imported total. The recorder
 continues the sum from the sensor's last short-term row, so the sensor shifts
 the rows compiled since the meter started up by that total.
+
+Driving reported more than ~30 days late never shows up as a daily row, so
+the meters cannot count it. It is only detected: the API's total for the
+current and three previous months then grows by more than the daily rows,
+and the tracker logs a warning.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta, tzinfo
@@ -38,6 +44,8 @@ from typing import Any, Literal, Protocol
 
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import LENGTH_MILES
+
+_LOGGER = logging.getLogger(__name__)
 
 # Longer than the ~30 days the API returns, so a row is never forgotten
 # while the API can still revise it.
@@ -182,6 +190,12 @@ class DrivingMeter:
     distance: DailyTotal = field(default_factory=DailyTotal)
     odometer_at_start_km: float | None = None
     api_wh_per_km_at_start: float | None = None
+    # The API's energy total over the current and three previous months.
+    months_wh: float | None = None
+    months_carry_wh: float = 0.0
+    # Growth of that total not explained by the daily rows: driving reported
+    # for days older than the daily window, which the meters cannot count.
+    missed_wh: float = 0.0
 
     @property
     def initialized(self) -> bool:
@@ -196,15 +210,44 @@ class DrivingMeter:
         odometer_km: float | None = None,
         api_wh_per_km: float | None = None,
         now: datetime | None = None,
+        months_wh: float | None = None,
     ) -> bool:
         """Apply the latest daily rows; return True if anything changed."""
         starting = not self.energy.initialized
+        measured = self.energy.measured
         changed = self.energy.update(energy_rows, today, now)
         if starting and self.energy.initialized:
             self.odometer_at_start_km = odometer_km
             self.api_wh_per_km_at_start = api_wh_per_km
+        if energy_rows and months_wh is not None:
+            # Only with daily rows: otherwise their growth is unknown.
+            changed = (
+                self._check_months(float(months_wh), self.energy.measured - measured)
+                or changed
+            )
         # Not short-circuited: both totals must see every poll.
         return self.distance.update(distance_rows, today, now) or changed
+
+    def _check_months(self, months_wh: float, counted_wh: float) -> bool:
+        """Add growth of the monthly total beyond ``counted_wh`` to ``missed_wh``.
+
+        The two totals come from separate requests, so a trip reported in
+        between shows as a shortfall in one poll and an excess in the next;
+        a shortfall is carried to the next poll once. A month dropping out of
+        the total is a shortfall too, and is carried once as well.
+        """
+        if self.months_wh is None:
+            self.months_wh = months_wh
+            return True
+        if months_wh == self.months_wh and not counted_wh and not self.months_carry_wh:
+            return False
+        raw = months_wh - self.months_wh - counted_wh
+        unexplained = raw + self.months_carry_wh
+        self.months_wh = months_wh
+        self.months_carry_wh = raw if raw < 0 else 0.0
+        if unexplained > 0:
+            self.missed_wh += unexplained
+        return True
 
     def lifetime_estimate_wh(self, wh_per_km: float | None) -> float | None:
         """Estimate lifetime driving energy: start odometer x average + measured."""
@@ -240,6 +283,9 @@ class DrivingMeter:
             distance=distance,
             odometer_at_start_km=data.get("odometer_at_start_km"),
             api_wh_per_km_at_start=data.get("api_wh_per_km_at_start"),
+            months_wh=data.get("months_wh"),
+            months_carry_wh=float(data.get("months_carry_wh", 0.0)),
+            missed_wh=float(data.get("missed_wh", 0.0)),
         )
 
 
@@ -370,6 +416,7 @@ class DrivingMeterTracker:
     async def async_process(self) -> None:
         """Apply the vehicle's current rows; save before publishing."""
         now = self._now()
+        missed = self.meter.missed_wh if self.meter is not None else 0.0
         if not await self._async_change(
             lambda meter: meter.update(
                 daily_rows(self._vehicle),
@@ -378,9 +425,19 @@ class DrivingMeterTracker:
                 odometer_km(self._vehicle),
                 self._vehicle.power_consumption_30d,
                 now,
+                self._vehicle.total_power_consumed,
             )
         ):
             return
+        if self.meter is not None and self.meter.missed_wh > missed:
+            _LOGGER.warning(
+                "%s: %.0f Wh of driving was reported for days older than the "
+                "~30 days of daily rows. It is not in Driving Energy or Driving "
+                "Distance (%.0f Wh missed so far)",
+                self._vehicle.name,
+                self.meter.missed_wh - missed,
+                self.meter.missed_wh,
+            )
         for listener in list(self._listeners):
             listener()
 

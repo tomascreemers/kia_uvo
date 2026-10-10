@@ -173,6 +173,79 @@ def test_round_trip() -> None:
     assert DrivingMeter.from_dict(meter.as_dict()) == meter
 
 
+def months_meter() -> DrivingMeter:
+    meter = DrivingMeter()
+    meter.update(rows(d20261006=25516, d20261008=19465), None, TODAY, months_wh=962025)
+    return meter
+
+
+def test_months_total_matching_the_daily_rows_misses_nothing() -> None:
+    # Recorded 2026-10-10: both grew by 7155 + 221 Wh.
+    meter = months_meter()
+    saturday = date(2026, 10, 10)
+    meter.update(
+        rows(d20261006=25516, d20261008=26620, d20261010=221),
+        None,
+        saturday,
+        months_wh=969401,
+    )
+    assert meter.missed_wh == 0
+    assert meter.months_wh == 969401
+
+
+def test_months_total_growing_beyond_the_daily_rows_is_missed() -> None:
+    # A trip from 40 days ago arrives with today's drive: only the monthly
+    # total shows it.
+    meter = months_meter()
+    meter.update(
+        rows(d20261006=25516, d20261008=19465), None, TODAY, months_wh=962025 + 5000
+    )
+    assert meter.missed_wh == 5000
+
+
+def test_trip_between_the_two_requests_is_not_missed() -> None:
+    meter = months_meter()
+    # Monthly total fetched just before the trip arrived, daily rows after.
+    meter.update(rows(d20261006=25516, d20261008=20465), None, TODAY, months_wh=962025)
+    meter.update(rows(d20261006=25516, d20261008=20465), None, TODAY, months_wh=963025)
+    assert meter.missed_wh == 0
+    assert meter.months_carry_wh == 0
+
+
+def test_month_dropping_out_is_not_missed_and_not_carried_on() -> None:
+    meter = months_meter()
+    november = date(2026, 11, 1)
+    # July drops out of the monthly total.
+    meter.update(rows(d20261008=19465), None, november, months_wh=962025 - 234990)
+    meter.update(rows(d20261008=19465), None, november, months_wh=962025 - 234990)
+    meter.update(
+        rows(d20261008=19465), None, november, months_wh=962025 - 234990 + 3000
+    )
+    assert meter.missed_wh == 3000
+
+
+def test_months_total_needs_daily_rows() -> None:
+    meter = months_meter()
+    assert not meter.update(None, None, TODAY, months_wh=970000)
+    meter.update(rows(d20261006=25516, d20261008=27440), None, TODAY, months_wh=970000)
+    assert meter.missed_wh == 0
+
+
+async def test_tracker_warns_about_missed_driving(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = FakeStore()
+    vehicle = ev(rows(d20261006=13089))
+    tracker = DrivingMeterTracker(store, vehicle, lambda: NOW)
+    await tracker.async_load()
+    await tracker.async_process()
+    vehicle.total_power_consumed += 4000
+    vehicle.daily_stats = ev(rows(d20261006=13089, d20261008=1000)).daily_stats
+    await tracker.async_process()
+    assert store.data is not None and store.data["missed_wh"] == 3000
+    assert "3000 Wh of driving was reported for days older" in caplog.text
+
+
 def test_energy_only_store_is_read() -> None:
     meter = DrivingMeter.from_dict(
         {
@@ -276,6 +349,7 @@ async def test_tracker_saves_before_publishing() -> None:
 
     tracker.add_listener(listener)
     vehicle.daily_stats = ev(rows(d20261006=13089, d20261008=13238)).daily_stats
+    vehicle.total_power_consumed += 13238
     await tracker.async_process()
     saves = store.saves
     await tracker.async_process()  # nothing changed
