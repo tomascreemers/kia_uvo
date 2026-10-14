@@ -61,6 +61,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# After a failed force refresh, wait this long (or the force refresh interval,
+# if shorter) before waking the car again. A car that does not answer in time
+# often still gets the request, and every attempt drains its 12 V battery.
+FORCE_REFRESH_RETRY_DELAY = timedelta(hours=6)
+
 # Render-invalidation signal for the SVM image entities: sent by
 # set_svm_dewarp, consumed in image.py.
 SIGNAL_SVM_RENDER = DOMAIN + "_{}_svm_render"
@@ -109,6 +114,7 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
             )
             * 60
         )
+        self._force_refresh_retry_at: dt.datetime | None = None
         self.no_force_refresh_hour_start: int = config_entry.options.get(
             CONF_NO_FORCE_REFRESH_HOUR_START, DEFAULT_NO_FORCE_REFRESH_HOUR_START
         )
@@ -174,8 +180,7 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
                 retry_after=60,
             ) from err
         current_hour = dt_util.now().hour
-
-        if (
+        in_force_refresh_hours = (
             (self.no_force_refresh_hour_start <= self.no_force_refresh_hour_finish)
             and (
                 current_hour < self.no_force_refresh_hour_start
@@ -187,16 +192,29 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
                 current_hour < self.no_force_refresh_hour_start
                 and current_hour >= self.no_force_refresh_hour_finish
             )
-        ):
+        )
+        retry_pending = (
+            self._force_refresh_retry_at is not None
+            and dt_util.utcnow() < self._force_refresh_retry_at
+        )
+
+        if in_force_refresh_hours and not retry_pending:
             try:
                 await self.hass.async_add_executor_job(
                     self.vehicle_manager.check_and_force_update_vehicles,
                     self.force_refresh_interval,
                 )
+                self._force_refresh_retry_at = None
             except Exception:
+                self._force_refresh_retry_at = dt_util.utcnow() + min(
+                    FORCE_REFRESH_RETRY_DELAY,
+                    timedelta(seconds=self.force_refresh_interval),
+                )
                 try:
                     _LOGGER.exception(
-                        f"Force update failed, falling back to cached: {traceback.format_exc()}"
+                        f"Force update failed, not retrying before "
+                        f"{self._force_refresh_retry_at.isoformat()}, "
+                        f"falling back to cached: {traceback.format_exc()}"
                     )
                     await self.hass.async_add_executor_job(
                         self.vehicle_manager.update_all_vehicles_with_cached_state

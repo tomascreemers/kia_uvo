@@ -81,7 +81,8 @@
           "no_force_refresh_hour_start": "[%key:component::hyundai_kia_connect::options::step::init::data::no_force_refresh_hour_start%]",
           "no_force_refresh_hour_finish": "[%key:component::hyundai_kia_connect::options::step::init::data::no_force_refresh_hour_finish%]",
           "enable_geolocation_entity": "[%key:component::hyundai_kia_connect::options::step::init::data::enable_geolocation_entity%]",
-          "use_email_with_geocode_api": "[%key:component::hyundai_kia_connect::options::step::init::data::use_email_with_geocode_api%]"
+          "use_email_with_geocode_api": "[%key:component::hyundai_kia_connect::options::step::init::data::use_email_with_geocode_api%]",
+          "lifetime_average_consumption": "Lifetime average consumption shown by the car (kWh/100 km), used only for the lifetime driving energy estimate"
         }
       }
     }
@@ -99,6 +100,12 @@
       },
       "data": {
         "name": "Data"
+      },
+      "driving_distance": {
+        "name": "Driving Distance"
+      },
+      "driving_energy": {
+        "name": "Driving Energy"
       },
       "dtc_count": {
         "name": "DTC Count"
@@ -190,6 +197,9 @@
       "last_scanned_at": {
         "name": "Last Scanned At"
       },
+      "lifetime_driving_energy_estimate": {
+        "name": "Lifetime Driving Energy (Estimate)"
+      },
       "next_service_distance": {
         "name": "Next Service"
       },
@@ -200,7 +210,7 @@
         "name": "Outside temperature"
       },
       "power_consumption_30d": {
-        "name": "Average Energy Consumption"
+        "name": "30 Day Average Energy Consumption"
       },
       "rear_left_seat_status": {
         "name": "Rear Left Seat"
