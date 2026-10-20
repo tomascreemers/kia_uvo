@@ -21,7 +21,6 @@ from custom_components.kia_uvo.driving_energy import (
 )
 from tests.conftest import make_coordinator, make_hass
 
-TODAY = date(2026, 10, 8)
 TZ = ZoneInfo("Europe/Brussels")
 NOW = datetime(2026, 10, 8, 21, 7, tzinfo=TZ)
 
@@ -36,7 +35,6 @@ def started_meter() -> DrivingMeter:
     meter.update(
         rows(d20261005=26762, d20261006=13089),
         rows(d20261005=161, d20261006=78),
-        TODAY,
         NOW,
         odometer_km=50828.1,
         api_wh_per_km=158.0,
@@ -56,10 +54,10 @@ def test_late_past_day_is_kept_apart_from_today() -> None:
     meter = started_meter()
     # Recorded 2026-10-08: the 6 Oct return trip arrived 39 h late,
     # together with the first drive of 8 Oct.
-    meter.update(rows(d20261005=26762, d20261006=25516, d20261008=13238), None, TODAY)
+    meter.update(rows(d20261005=26762, d20261006=25516, d20261008=13238), None, NOW)
     assert meter.energy.total == 13238
     assert meter.energy.late == {"2026-10-06": 12427}
-    meter.update(rows(d20261005=26762, d20261006=25516, d20261008=19465), None, TODAY)
+    meter.update(rows(d20261005=26762, d20261006=25516, d20261008=19465), None, NOW)
     assert meter.energy.total == 19465
     assert meter.energy.measured == 31892
 
@@ -72,10 +70,9 @@ def test_trip_uploaded_two_days_late() -> None:
     meter.update(
         rows(d20261006=25516, d20261008=19465),
         rows(d20261006=156, d20261008=116),
-        thursday.date(),
         thursday,
     )
-    saturday = date(2026, 10, 10)
+    saturday = datetime(2026, 10, 10, 9, tzinfo=TZ)
     meter.update(
         rows(d20261006=25516, d20261008=26620, d20261010=221),
         rows(d20261006=156, d20261008=158, d20261010=2),
@@ -92,7 +89,7 @@ def test_trip_uploaded_two_days_late() -> None:
 
 def test_late_change_before_the_start_goes_to_the_backfilled_hour() -> None:
     meter = started_meter()
-    meter.update(rows(d20261005=27000, d20261006=13089), None, TODAY)
+    meter.update(rows(d20261005=27000, d20261006=13089), None, NOW)
     assert meter.energy.late == {"2026-10-05": 238}
     assert meter.energy.late_hour("2026-10-05", TZ) == datetime(
         2026, 10, 5, 12, tzinfo=TZ
@@ -101,10 +98,10 @@ def test_late_change_before_the_start_goes_to_the_backfilled_hour() -> None:
 
 def test_mark_backdated_moves_late_into_backdated() -> None:
     meter = started_meter()
-    meter.update(rows(d20261005=27000, d20261006=14089), None, TODAY)
+    meter.update(rows(d20261005=27000, d20261006=14089), None, NOW)
     applied = dict(meter.energy.late)
     # More arrives for the same day before the first part is marked.
-    meter.update(rows(d20261005=27100, d20261006=14089), None, TODAY)
+    meter.update(rows(d20261005=27100, d20261006=14089), None, NOW)
     meter.energy.mark_backdated(applied)
     assert meter.energy.late == {"2026-10-05": 100}
     assert meter.energy.backdated == 1238
@@ -116,29 +113,29 @@ def test_mark_backdated_moves_late_into_backdated() -> None:
 @pytest.mark.parametrize("empty", [None, {}])
 def test_empty_response_changes_nothing(empty: dict[date, float] | None) -> None:
     meter = started_meter()
-    assert not meter.update(empty, empty, TODAY)
-    meter.update(rows(d20261005=26762, d20261006=13089), None, TODAY)
+    assert not meter.update(empty, empty, NOW)
+    meter.update(rows(d20261005=26762, d20261006=13089), None, NOW)
     assert meter.energy.measured == 0
 
 
 def test_row_missing_from_one_response_is_not_counted_again() -> None:
     meter = started_meter()
-    meter.update(rows(d20261006=13089), None, TODAY)
-    meter.update(rows(d20261005=26762, d20261006=13089), None, TODAY)
+    meter.update(rows(d20261006=13089), None, NOW)
+    meter.update(rows(d20261005=26762, d20261006=13089), None, NOW)
     assert meter.energy.measured == 0
 
 
 def test_downward_correction_is_subtracted() -> None:
     meter = started_meter()
-    meter.update(rows(d20261005=26000, d20261006=13089, d20261008=500), None, TODAY)
-    meter.update(rows(d20261005=26000, d20261006=13089, d20261008=400), None, TODAY)
+    meter.update(rows(d20261005=26000, d20261006=13089, d20261008=500), None, NOW)
+    meter.update(rows(d20261005=26000, d20261006=13089, d20261008=400), None, NOW)
     assert meter.energy.late == {"2026-10-05": -762}
     assert meter.energy.total == 400
 
 
 def test_rows_are_forgotten_by_age_and_old_rows_ignored() -> None:
     meter = started_meter()
-    later = date(2026, 11, 12)
+    later = datetime(2026, 11, 12, 9, tzinfo=TZ)
     meter.update(rows(d20261110=5000), None, later)
     assert set(meter.energy.rows) == {"2026-11-10"}
     assert meter.energy.late == {"2026-11-10": 5000}
@@ -150,14 +147,14 @@ def test_rows_are_forgotten_by_age_and_old_rows_ignored() -> None:
 def test_distance_starts_on_its_own() -> None:
     meter = started_meter()
     meter.distance = DailyTotal()
-    meter.update(None, rows(d20261006=78), TODAY)
+    meter.update(None, rows(d20261006=78), NOW)
     assert meter.distance.initialized
     assert meter.distance.total == 0
 
 
 def test_lifetime_estimate() -> None:
     meter = started_meter()
-    meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), None, TODAY)
+    meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), None, NOW)
     measured = 1000 + 1000
     assert meter.lifetime_estimate_wh(185.0) == pytest.approx(50828.1 * 185 + measured)
     assert meter.lifetime_estimate_wh(None) == pytest.approx(50828.1 * 158 + measured)
@@ -166,21 +163,21 @@ def test_lifetime_estimate() -> None:
 
 def test_round_trip() -> None:
     meter = started_meter()
-    meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), None, TODAY)
+    meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), None, NOW)
     meter.energy.mark_backdated({"2026-10-05": 400})
     assert DrivingMeter.from_dict(meter.as_dict()) == meter
 
 
 def months_meter() -> DrivingMeter:
     meter = DrivingMeter()
-    meter.update(rows(d20261006=25516, d20261008=19465), None, TODAY, months_wh=962025)
+    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, months_wh=962025)
     return meter
 
 
 def test_months_total_matching_the_daily_rows_misses_nothing() -> None:
     # Recorded 2026-10-10: both grew by 7155 + 221 Wh.
     meter = months_meter()
-    saturday = date(2026, 10, 10)
+    saturday = datetime(2026, 10, 10, 9, tzinfo=TZ)
     meter.update(
         rows(d20261006=25516, d20261008=26620, d20261010=221),
         None,
@@ -196,7 +193,7 @@ def test_months_total_growing_beyond_the_daily_rows_is_missed() -> None:
     # total shows it.
     meter = months_meter()
     meter.update(
-        rows(d20261006=25516, d20261008=19465), None, TODAY, months_wh=962025 + 5000
+        rows(d20261006=25516, d20261008=19465), None, NOW, months_wh=962025 + 5000
     )
     assert meter.missed_wh == 5000
 
@@ -204,15 +201,15 @@ def test_months_total_growing_beyond_the_daily_rows_is_missed() -> None:
 def test_trip_between_the_two_requests_is_not_missed() -> None:
     meter = months_meter()
     # Monthly total fetched just before the trip arrived, daily rows after.
-    meter.update(rows(d20261006=25516, d20261008=20465), None, TODAY, months_wh=962025)
-    meter.update(rows(d20261006=25516, d20261008=20465), None, TODAY, months_wh=963025)
+    meter.update(rows(d20261006=25516, d20261008=20465), None, NOW, months_wh=962025)
+    meter.update(rows(d20261006=25516, d20261008=20465), None, NOW, months_wh=963025)
     assert meter.missed_wh == 0
     assert meter.months_carry_wh == 0
 
 
 def test_month_dropping_out_is_not_missed_and_not_carried_on() -> None:
     meter = months_meter()
-    november = date(2026, 11, 1)
+    november = datetime(2026, 11, 1, 9, tzinfo=TZ)
     # July drops out of the monthly total.
     meter.update(rows(d20261008=19465), None, november, months_wh=962025 - 234990)
     meter.update(rows(d20261008=19465), None, november, months_wh=962025 - 234990)
@@ -224,8 +221,8 @@ def test_month_dropping_out_is_not_missed_and_not_carried_on() -> None:
 
 def test_months_total_needs_daily_rows() -> None:
     meter = months_meter()
-    assert not meter.update(None, None, TODAY, months_wh=970000)
-    meter.update(rows(d20261006=25516, d20261008=27440), None, TODAY, months_wh=970000)
+    assert not meter.update(None, None, NOW, months_wh=970000)
+    meter.update(rows(d20261006=25516, d20261008=27440), None, NOW, months_wh=970000)
     assert meter.missed_wh == 0
 
 
@@ -242,34 +239,6 @@ async def test_tracker_warns_about_missed_driving(
     await tracker.async_process()
     assert store.data is not None and store.data["missed_wh"] == 3000
     assert "3000 Wh of driving was reported for days older" in caplog.text
-
-
-def test_energy_only_store_is_read() -> None:
-    meter = DrivingMeter.from_dict(
-        {
-            "total_wh": 7376.0,
-            "rows": {"2026-10-08": 26620, "2026-10-10": 221},
-            "started": "2026-10-08",
-            "odometer_at_start_km": 50945.2,
-            "api_wh_per_km_at_start": 158.7,
-            "started_at": "2026-10-08T21:07:00+02:00",
-            "baseline_rows": {"2026-10-08": 19465},
-            "backfilled": True,
-        }
-    )
-    assert meter.energy == DailyTotal(
-        total=7376,
-        rows={"2026-10-08": 26620, "2026-10-10": 221},
-        started="2026-10-08",
-        started_at="2026-10-08T21:07:00+02:00",
-        baseline_rows={"2026-10-08": 19465},
-        # Imported with sums ending at 0: needs importing again.
-        backfill_version=1,
-    )
-    assert not meter.energy.backfilled
-    assert not meter.distance.initialized
-    assert meter.odometer_at_start_km == 50945.2
-    assert meter.api_wh_per_km_at_start == 158.7
 
 
 class FakeStore:
@@ -399,7 +368,6 @@ def test_backfill_starts_at_zero_before_first_state() -> None:
     meter.update(
         rows(d20261005=26762, d20261006=25516, d20261008=19465),
         None,
-        TODAY,
         NOW,
     )
     backfill = backfill_statistics(meter.energy, TZ)
@@ -416,28 +384,12 @@ def test_backfill_starts_at_zero_before_first_state() -> None:
 def test_backfill_moves_start_day_before_a_morning_install() -> None:
     meter = DrivingMeter()
     morning = datetime(2026, 10, 8, 9, 30, tzinfo=TZ)
-    meter.update(rows(d20261008=500), None, TODAY, morning)
+    meter.update(rows(d20261008=500), None, morning)
     backfill = backfill_statistics(meter.energy, TZ)
     assert backfill is not None
     # The last full hour before the meter's first state.
     assert backfill.rows == [(datetime(2026, 10, 8, 8, tzinfo=TZ), 500)]
     assert backfill.meter_start == datetime(2026, 10, 8, 9, tzinfo=TZ)
-
-
-def test_backfill_for_meter_started_without_baseline_rows() -> None:
-    # Stores written before baseline rows existed: only days before the
-    # start date, since later deltas may already be in the meter.
-    meter = DrivingMeter.from_dict(
-        {
-            "total_wh": 1500.0,
-            "rows": {"2026-10-06": 25516, "2026-10-08": 20965},
-            "started": "2026-10-08",
-        }
-    )
-    backfill = backfill_statistics(meter.energy, TZ)
-    assert backfill is not None
-    assert backfill.rows == [(datetime(2026, 10, 6, 12, tzinfo=TZ), 25516)]
-    assert backfill.meter_start == datetime(2026, 10, 8, tzinfo=TZ)
 
 
 def test_backfill_needs_a_started_meter() -> None:
@@ -451,8 +403,8 @@ async def test_tracker_marks_backfilled_and_backdated() -> None:
     await tracker.async_process()
     await tracker.async_mark_backfilled("distance")
     assert store.data is not None
-    assert store.data["distance"]["backfill_version"] == 2
-    assert store.data["energy"]["backfill_version"] == 0
+    assert store.data["distance"]["backfilled"]
+    assert not store.data["energy"]["backfilled"]
     assert store.data["energy"]["baseline_rows"] == {"2026-10-06": 13089}
 
     tracker._vehicle = ev(rows(d20261006=14089))
