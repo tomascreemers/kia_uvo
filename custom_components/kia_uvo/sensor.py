@@ -39,7 +39,12 @@ from homeassistant.util.unit_conversion import (
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import ENGINE_TYPES
 
-from .const import CHARGING_CURRENTS, DOMAIN, DYNAMIC_UNIT
+from .const import (
+    CHARGING_CURRENTS,
+    CONF_LIFETIME_AVERAGE_CONSUMPTION,
+    DOMAIN,
+    DYNAMIC_UNIT,
+)
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
 from .driving_energy import (
     DailyTotal,
@@ -630,7 +635,7 @@ async def _async_driving_energy_entities(
     coordinator: HyundaiKiaConnectDataUpdateCoordinator,
     vehicle: Vehicle,
 ) -> list[SensorEntity]:
-    """Set up the driving energy and distance meters."""
+    """Set up the driving energy and distance meters and the lifetime estimate."""
     tracker = DrivingMeterTracker(
         Store[dict[str, Any]](
             hass,
@@ -650,9 +655,17 @@ async def _async_driving_energy_entities(
         )
 
     config_entry.async_on_unload(coordinator.async_add_listener(_schedule_process))
+    average: float | None = config_entry.options.get(CONF_LIFETIME_AVERAGE_CONSUMPTION)
     return [
         DrivingEnergySensor(coordinator, vehicle, tracker),
         DrivingDistanceSensor(coordinator, vehicle, tracker),
+        LifetimeDrivingEnergyEstimateSensor(
+            coordinator,
+            vehicle,
+            tracker,
+            # kWh/100 km equals 10 Wh/km.
+            average * 10 if average else None,
+        ),
     ]
 
 
@@ -875,6 +888,66 @@ class DrivingDistanceSensor(DrivingTotalSensor):
     _quantity = "distance"
     _converter = DistanceConverter
     _native_unit = UnitOfLength.KILOMETERS
+
+
+class LifetimeDrivingEnergyEstimateSensor(SensorEntity, HyundaiKiaConnectEntity):
+    """Estimated lifetime driving energy, for display only.
+
+    Energy before the meter started is estimated as the odometer at that time
+    times an average consumption. It has no state class, so changing the
+    average never affects statistics.
+    """
+
+    _attr_translation_key = "lifetime_driving_energy_estimate"
+    _attr_icon = "mdi:car-electric"
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_native_unit_of_measurement = UnitOfEnergy.WATT_HOUR
+    _attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+        vehicle: Vehicle,
+        tracker: DrivingMeterTracker,
+        wh_per_km: float | None,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, vehicle)
+        self._tracker = tracker
+        self._wh_per_km = wh_per_km
+        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_lifetime_driving_energy_estimate"
+
+    async def async_added_to_hass(self) -> None:
+        """Publish whenever the tracker has saved a change."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self._tracker.add_listener(self.async_write_ha_state))
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the estimate, or None when it cannot be made."""
+        meter = self._tracker.meter
+        if meter is None:
+            return None
+        return meter.lifetime_estimate_wh(self._wh_per_km)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return what the estimate is based on."""
+        meter = self._tracker.meter
+        if meter is None or not meter.initialized:
+            return {}
+        wh_per_km = self._wh_per_km or meter.api_wh_per_km_at_start
+        return {
+            "measured_since": meter.energy.started,
+            "odometer_at_start_km": meter.odometer_at_start_km,
+            "average_consumption_kwh_per_100km": (
+                round(wh_per_km / 10, 2) if wh_per_km is not None else None
+            ),
+            "average_source": (
+                "configured" if self._wh_per_km else "api_30_day_average"
+            ),
+        }
 
 
 class HyundaiKiaConnectSensor(RestoreSensor, SensorEntity, HyundaiKiaConnectEntity):

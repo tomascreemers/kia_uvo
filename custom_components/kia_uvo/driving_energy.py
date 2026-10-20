@@ -188,6 +188,8 @@ class DrivingMeter:
 
     energy: DailyTotal = field(default_factory=DailyTotal)
     distance: DailyTotal = field(default_factory=DailyTotal)
+    odometer_at_start_km: float | None = None
+    api_wh_per_km_at_start: float | None = None
     # The API's energy total over the current and three previous months.
     months_wh: float | None = None
     months_carry_wh: float = 0.0
@@ -207,10 +209,16 @@ class DrivingMeter:
         today: date,
         now: datetime | None = None,
         months_wh: float | None = None,
+        odometer_km: float | None = None,
+        api_wh_per_km: float | None = None,
     ) -> bool:
         """Apply the latest daily rows; return True if anything changed."""
+        starting = not self.energy.initialized
         measured = self.energy.measured
         changed = self.energy.update(energy_rows, today, now)
+        if starting and self.energy.initialized:
+            self.odometer_at_start_km = odometer_km
+            self.api_wh_per_km_at_start = api_wh_per_km
         if energy_rows and months_wh is not None:
             # Only with daily rows: otherwise their growth is unknown.
             changed = (
@@ -241,6 +249,18 @@ class DrivingMeter:
             self.missed_wh += unexplained
         return True
 
+    def lifetime_estimate_wh(self, wh_per_km: float | None) -> float | None:
+        """Estimate lifetime driving energy: start odometer x average + measured."""
+        if wh_per_km is None:
+            wh_per_km = self.api_wh_per_km_at_start
+        if (
+            not self.initialized
+            or self.odometer_at_start_km is None
+            or wh_per_km is None
+        ):
+            return None
+        return self.odometer_at_start_km * wh_per_km + self.energy.measured
+
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation."""
         return asdict(self)
@@ -261,6 +281,8 @@ class DrivingMeter:
         return cls(
             energy=energy,
             distance=distance,
+            odometer_at_start_km=data.get("odometer_at_start_km"),
+            api_wh_per_km_at_start=data.get("api_wh_per_km_at_start"),
             months_wh=data.get("months_wh"),
             months_carry_wh=float(data.get("months_carry_wh", 0.0)),
             missed_wh=float(data.get("missed_wh", 0.0)),
@@ -349,6 +371,16 @@ def daily_distance_rows(vehicle: Vehicle) -> dict[date, float] | None:
     return rows or None
 
 
+def odometer_km(vehicle: Vehicle) -> float | None:
+    """Return the odometer in km, or None when unknown."""
+    value = vehicle.odometer
+    if value is None:
+        return None
+    if vehicle.odometer_unit == LENGTH_MILES:
+        return float(value) * KM_PER_MILE
+    return float(value)
+
+
 class MeterStore(Protocol):
     """The subset of ``homeassistant.helpers.storage.Store`` used here."""
 
@@ -392,6 +424,8 @@ class DrivingMeterTracker:
                 now.date(),
                 now,
                 self._vehicle.total_power_consumed,
+                odometer_km(self._vehicle),
+                self._vehicle.power_consumption_30d,
             )
         ):
             return

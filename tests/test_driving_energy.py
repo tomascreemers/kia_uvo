@@ -11,6 +11,7 @@ from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.Vehicle import DailyDrivingStats
 
 from custom_components.kia_uvo import sensor as sensor_platform
+from custom_components.kia_uvo.const import CONF_LIFETIME_AVERAGE_CONSUMPTION
 from custom_components.kia_uvo.driving_energy import (
     DailyTotal,
     DrivingMeter,
@@ -37,6 +38,8 @@ def started_meter() -> DrivingMeter:
         rows(d20261005=161, d20261006=78),
         TODAY,
         NOW,
+        odometer_km=50828.1,
+        api_wh_per_km=158.0,
     )
     return meter
 
@@ -46,6 +49,7 @@ def test_first_rows_only_set_the_baseline() -> None:
     assert meter.initialized
     assert meter.energy.total == 0
     assert meter.distance.total == 0
+    assert meter.odometer_at_start_km == 50828.1
 
 
 def test_late_past_day_is_kept_apart_from_today() -> None:
@@ -151,6 +155,15 @@ def test_distance_starts_on_its_own() -> None:
     assert meter.distance.total == 0
 
 
+def test_lifetime_estimate() -> None:
+    meter = started_meter()
+    meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), None, TODAY)
+    measured = 1000 + 1000
+    assert meter.lifetime_estimate_wh(185.0) == pytest.approx(50828.1 * 185 + measured)
+    assert meter.lifetime_estimate_wh(None) == pytest.approx(50828.1 * 158 + measured)
+    assert DrivingMeter().lifetime_estimate_wh(185.0) is None
+
+
 def test_round_trip() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), None, TODAY)
@@ -237,6 +250,8 @@ def test_energy_only_store_is_read() -> None:
             "total_wh": 7376.0,
             "rows": {"2026-10-08": 26620, "2026-10-10": 221},
             "started": "2026-10-08",
+            "odometer_at_start_km": 50945.2,
+            "api_wh_per_km_at_start": 158.7,
             "started_at": "2026-10-08T21:07:00+02:00",
             "baseline_rows": {"2026-10-08": 19465},
             "backfilled": True,
@@ -253,6 +268,8 @@ def test_energy_only_store_is_read() -> None:
     )
     assert not meter.energy.backfilled
     assert not meter.distance.initialized
+    assert meter.odometer_at_start_km == 50945.2
+    assert meter.api_wh_per_km_at_start == 158.7
 
 
 class FakeStore:
@@ -357,13 +374,14 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sensor_platform, "Store", FakeStoreType)
     vehicle = ev(rows(d20261006=13089))
     hass, config_entry = make_hass(make_coordinator(vehicle))
-    config_entry.options = {}
+    config_entry.options = {CONF_LIFETIME_AVERAGE_CONSUMPTION: 18.5}
     created: list[Any] = []
     await sensor_platform.async_setup_entry(hass, config_entry, created.extend)
 
     by_type = {type(entity).__name__: entity for entity in created}
     meter = by_type["DrivingEnergySensor"]
     distance = by_type["DrivingDistanceSensor"]
+    estimate = by_type["LifetimeDrivingEnergyEstimateSensor"]
     assert meter.state_class == SensorStateClass.TOTAL
     assert meter.native_value == 0
     assert meter.unique_id == "kia_uvo_v1_driving_energy"
@@ -372,6 +390,8 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     assert distance.native_value == 0
     assert distance.unique_id == "kia_uvo_v1_driving_distance"
     assert distance.native_unit_of_measurement == "km"
+    assert estimate.state_class is None
+    assert estimate.native_value == pytest.approx(50828.1 * 185)
 
     window = next(
         entity
@@ -585,7 +605,9 @@ async def test_sensor_books_late_change_on_its_day_once(
     assert tracker.meter.energy.late == {}
     assert energy.native_value == 500
     assert energy.extra_state_attributes["booked_on_earlier_days_wh"] == 1600
-    assert tracker.meter.energy.measured == 2100
+    assert tracker.meter.lifetime_estimate_wh(158.0) == pytest.approx(
+        50828.1 * 158 + 2100
+    )
 
 
 async def test_sensor_without_recorder_keeps_late_changes(
