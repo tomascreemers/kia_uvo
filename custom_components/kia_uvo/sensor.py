@@ -266,7 +266,9 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
         icon="mdi:car-electric",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL,
+        # A rolling 90-day window shrinks as days drop out; with a state
+        # class, statistics would book every shrink as negative usage.
+        # driving_energy is the statistics-safe counterpart.
     ),
     HyundaiKiaSensorEntityDescription(
         key="total_power_regenerated",
@@ -274,7 +276,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
         icon="mdi:car-electric",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL,
+        # Rolling 90-day window, see total_power_consumed.
     ),
     # Need to remove km hard coding.  Underlying API needs this fixed first.  EU always does KM.
     HyundaiKiaSensorEntityDescription(

@@ -373,6 +373,14 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     assert distance.unique_id == "kia_uvo_v1_driving_distance"
     assert distance.native_unit_of_measurement == "km"
 
+    window = next(
+        entity
+        for entity in created
+        if getattr(entity, "entity_description", None) is not None
+        and entity.entity_description.key == "total_power_consumed"
+    )
+    assert window.state_class is None
+
 
 def test_backfill_starts_at_zero_before_first_state() -> None:
     meter = DrivingMeter()
