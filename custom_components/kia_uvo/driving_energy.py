@@ -56,9 +56,6 @@ BACKFILL_HOUR = time(12)
 # Days since the meter: the API gives no time, and a late change is driving
 # after the last report of that day, so book it in the day's last hour.
 LATE_HOUR = time(23)
-# 1: imported sums ended at 0, so the first imported day had a negative
-# change. 2: imported sums start at 0, compiled rows shifted up.
-BACKFILL_VERSION = 2
 
 Quantity = Literal["energy", "distance"]
 
@@ -76,8 +73,8 @@ class DailyTotal:
     rows: dict[str, float] = field(default_factory=dict)
     started: str | None = None
     started_at: str | None = None
-    baseline_rows: dict[str, float] | None = None
-    backfill_version: int = 0
+    baseline_rows: dict[str, float] = field(default_factory=dict)
+    backfilled: bool = False
     late: dict[str, float] = field(default_factory=dict)
     backdated: float = 0.0
 
@@ -87,11 +84,6 @@ class DailyTotal:
         return self.started is not None
 
     @property
-    def backfilled(self) -> bool:
-        """Return True once the days before the start are in statistics."""
-        return self.backfill_version >= BACKFILL_VERSION
-
-    @property
     def measured(self) -> float:
         """Return everything counted since the start, wherever it is booked."""
         return self.total + self.backdated + sum(self.late.values())
@@ -99,8 +91,7 @@ class DailyTotal:
     def update(
         self,
         rows: Mapping[date, float] | None,
-        today: date,
-        now: datetime | None = None,
+        now: datetime,
     ) -> bool:
         """Apply the latest daily rows; return True if anything changed.
 
@@ -110,6 +101,7 @@ class DailyTotal:
         if not rows:
             # No information: keep everything as it is.
             return False
+        today = now.date()
         cutoff = (today - ROW_RETENTION).isoformat()
         latest = {
             day.isoformat(): float(value)
@@ -121,7 +113,7 @@ class DailyTotal:
             self.rows = latest
             self.baseline_rows = dict(latest)
             self.started = today.isoformat()
-            self.started_at = now.isoformat() if now is not None else None
+            self.started_at = now.isoformat()
             changed = True
         else:
             today_key = today.isoformat()
@@ -165,14 +157,8 @@ class DailyTotal:
             rows=_float_rows(data.get("rows", {})),
             started=data.get("started"),
             started_at=data.get("started_at"),
-            baseline_rows=(
-                _float_rows(baseline)
-                if (baseline := data.get("baseline_rows")) is not None
-                else None
-            ),
-            backfill_version=int(
-                data.get("backfill_version", 1 if data.get("backfilled") else 0)
-            ),
+            baseline_rows=_float_rows(data.get("baseline_rows", {})),
+            backfilled=bool(data.get("backfilled", False)),
             late=_float_rows(data.get("late", {})),
             backdated=float(data.get("backdated", 0.0)),
         )
@@ -204,13 +190,12 @@ class DrivingMeter:
         self,
         energy_rows: Mapping[date, float] | None,
         distance_rows: Mapping[date, float] | None,
-        today: date,
-        now: datetime | None = None,
+        now: datetime,
         months_wh: float | None = None,
     ) -> bool:
         """Apply the latest daily rows; return True if anything changed."""
         measured = self.energy.measured
-        changed = self.energy.update(energy_rows, today, now)
+        changed = self.energy.update(energy_rows, now)
         if energy_rows and months_wh is not None:
             # Only with daily rows: otherwise their growth is unknown.
             changed = (
@@ -218,7 +203,7 @@ class DrivingMeter:
                 or changed
             )
         # Not short-circuited: both totals must see every poll.
-        return self.distance.update(distance_rows, today, now) or changed
+        return self.distance.update(distance_rows, now) or changed
 
     def _check_months(self, months_wh: float, counted_wh: float) -> bool:
         """Add growth of the monthly total beyond ``counted_wh`` to ``missed_wh``.
@@ -247,20 +232,10 @@ class DrivingMeter:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DrivingMeter:
-        """Build a meter from ``as_dict`` output, or from the energy-only format.
-
-        The energy-only format kept energy at the top level, as ``total_wh``.
-        Its total included late changes; they stay where they were booked.
-        """
-        if "energy" in data:
-            energy = DailyTotal.from_dict(data["energy"])
-            distance = DailyTotal.from_dict(data.get("distance", {}))
-        else:
-            energy = DailyTotal.from_dict({**data, "total": data.get("total_wh", 0.0)})
-            distance = DailyTotal()
+        """Build a meter from ``as_dict`` output."""
         return cls(
-            energy=energy,
-            distance=distance,
+            energy=DailyTotal.from_dict(data.get("energy", {})),
+            distance=DailyTotal.from_dict(data.get("distance", {})),
             months_wh=data.get("months_wh"),
             months_carry_wh=float(data.get("months_carry_wh", 0.0)),
             missed_wh=float(data.get("missed_wh", 0.0)),
@@ -285,28 +260,18 @@ def backfill_statistics(total: DailyTotal, tz: tzinfo) -> Backfill | None:
     time. Every row lies strictly before the meter's first state: importing
     over hours the recorder already compiled would break the sum chain.
     """
-    if not total.initialized or total.started is None:
+    if total.started_at is None:
         return None
-    if total.baseline_rows is not None:
-        days = dict(total.baseline_rows)
-    else:
-        # Meters started before baseline rows were stored: only days before
-        # the start date are certainly free of energy the meter counted.
-        days = {k: v for k, v in total.rows.items() if k < total.started}
-    latest_hour: datetime | None = None
-    if total.started_at is not None:
-        started_at = datetime.fromisoformat(total.started_at).astimezone(tz)
-        meter_start = started_at.replace(minute=0, second=0, microsecond=0)
-        latest_hour = meter_start - timedelta(hours=1)
-    else:
-        meter_start = datetime.combine(date.fromisoformat(total.started), time(), tz)
+    days = total.baseline_rows
+    started_at = datetime.fromisoformat(total.started_at).astimezone(tz)
+    meter_start = started_at.replace(minute=0, second=0, microsecond=0)
+    latest_hour = meter_start - timedelta(hours=1)
     placed: list[tuple[datetime, float]] = []
     for key in sorted(days):
-        start = datetime.combine(date.fromisoformat(key), BACKFILL_HOUR, tz)
-        if latest_hour is not None and start > latest_hour:
-            start = latest_hour
-        elif latest_hour is None and key >= total.started:
-            continue
+        # The start day's row can fall after the meter's first state.
+        start = min(
+            datetime.combine(date.fromisoformat(key), BACKFILL_HOUR, tz), latest_hour
+        )
         if placed and start <= placed[-1][0]:
             # Two days in the same hour: merge into the earlier row.
             placed[-1] = (placed[-1][0], placed[-1][1] + days[key])
@@ -389,7 +354,6 @@ class DrivingMeterTracker:
             lambda meter: meter.update(
                 daily_rows(self._vehicle),
                 daily_distance_rows(self._vehicle),
-                now.date(),
                 now,
                 self._vehicle.total_power_consumed,
             )
@@ -411,7 +375,7 @@ class DrivingMeterTracker:
         """Record that the days before ``quantity``'s start were imported."""
 
         def mark(meter: DrivingMeter) -> bool:
-            getattr(meter, quantity).backfill_version = BACKFILL_VERSION
+            getattr(meter, quantity).backfilled = True
             return True
 
         await self._async_change(mark)

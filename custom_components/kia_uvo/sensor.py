@@ -801,7 +801,7 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
             "Imported %d days of driving %s before %s into %s",
             len(backfill.rows),
             self._quantity,
-            total.started_at or total.started,
+            total.started_at,
             self.entity_id,
         )
 
