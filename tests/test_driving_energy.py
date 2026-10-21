@@ -1,5 +1,6 @@
 """Tests for the statistics-safe driving energy meter."""
 
+import asyncio
 from datetime import date, datetime
 from typing import Any
 from unittest.mock import MagicMock
@@ -408,10 +409,17 @@ async def test_tracker_marks_backfilled_and_backdated() -> None:
 
 
 class FakeRecorder:
-    """Records ``async_adjust_statistics`` calls."""
+    """Records ``async_adjust_statistics`` calls.
+
+    A test can set ``commit`` to a pending future to hold back the commit.
+    """
 
     def __init__(self) -> None:
         self.adjusted: list[tuple[str, datetime, float, str]] = []
+        self.commit: asyncio.Future[None] | None = None
+
+    def async_get_commit_future(self) -> asyncio.Future[None] | None:
+        return self.commit
 
     def async_adjust_statistics(
         self, statistic_id: str, start: datetime, adjustment: float, unit: str
@@ -542,6 +550,38 @@ async def test_sensor_books_late_change_on_its_day_once(
     assert energy.native_value == 500
     assert energy.extra_state_attributes["booked_on_earlier_days_wh"] == 1600
     assert tracker.meter.energy.measured == 2100
+
+
+async def test_sensor_marks_changes_done_only_once_committed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash before the commit must leave the change to be made again."""
+    vehicle = ev(rows(d20261005=26762, d20261006=13089))
+    sensors, imported, fake_recorder = await _started_sensors(monkeypatch, vehicle)
+    energy = sensors["DrivingEnergySensor"]
+    tracker = energy._tracker
+    assert tracker.meter is not None
+
+    fake_recorder.commit = asyncio.get_running_loop().create_future()
+    update = asyncio.create_task(energy._async_update_statistics())
+    await asyncio.sleep(0)
+    assert len(imported) == 1
+    assert not tracker.meter.energy.backfilled
+    fake_recorder.commit.set_result(None)
+    await update
+    assert tracker.meter.energy.backfilled
+
+    tracker._vehicle = ev(rows(d20261005=26762, d20261006=14689))
+    await tracker.async_process()
+    fake_recorder.commit = asyncio.get_running_loop().create_future()
+    update = asyncio.create_task(energy._async_update_statistics())
+    await asyncio.sleep(0)
+    assert fake_recorder.adjusted[-1][2] == 1600
+    assert tracker.meter.energy.late == {"2026-10-06": 1600}
+    fake_recorder.commit.set_result(None)
+    await update
+    assert tracker.meter.energy.late == {}
+    assert tracker.meter.energy.backdated == 1600
 
 
 async def test_sensor_without_recorder_keeps_late_changes(
