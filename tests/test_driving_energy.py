@@ -237,7 +237,7 @@ def test_round_trip() -> None:
 
 
 def test_stored_format() -> None:
-    """The stored format must not change: meters already run on it."""
+    """Pin the stored format: changing it would need a storage migration."""
     meter = DrivingMeter()
     meter.update(rows(d20261006=13089), {}, NOW, window_wh=962025)
     meter.update(rows(d20261005=1000, d20261006=13089), {}, NOW, window_wh=963025)
