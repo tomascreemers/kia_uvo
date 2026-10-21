@@ -26,6 +26,11 @@ so the imported sums start at 0 and end at the imported total. The recorder
 continues the sum from the sensor's last short-term row, so the sensor shifts
 the rows compiled since the meter started up by that total.
 
+Each daily row also splits its energy into the motor, climate, electronics
+and battery care parts, which add up to the row's total, and reports the
+regenerated energy, which is not part of that total. Each part is a meter of
+its own, kept exactly like the total.
+
 Driving reported more than ~30 days late never shows up as a daily row, so
 the meters cannot count it. It is only detected: the API's rolling 90-day
 total then grows by more than the daily rows, and the tracker logs a
@@ -57,8 +62,36 @@ BACKFILL_HOUR = time(12)
 # after the last report of that day, so book it in the day's last hour.
 LATE_HOUR = time(23)
 
-Quantity = Literal["energy", "distance"]
-QUANTITY_UNITS: dict[Quantity, str] = {"energy": "Wh", "distance": "km"}
+Quantity = Literal[
+    "energy",
+    "distance",
+    "energy_motor",
+    "energy_climate",
+    "energy_electronics",
+    "energy_battery_care",
+    "energy_regenerated",
+]
+EnergyPart = Literal[
+    "energy_motor",
+    "energy_climate",
+    "energy_electronics",
+    "energy_battery_care",
+    "energy_regenerated",
+]
+# Each part's ``DailyDrivingStats`` attribute. All but the regenerated energy
+# add up to ``total_consumed``.
+ENERGY_PARTS: dict[EnergyPart, str] = {
+    "energy_motor": "engine_consumption",
+    "energy_climate": "climate_consumption",
+    "energy_electronics": "onboard_electronics_consumption",
+    "energy_battery_care": "battery_care_consumption",
+    "energy_regenerated": "regenerated_energy",
+}
+QUANTITY_UNITS: dict[Quantity, str] = {
+    "energy": "Wh",
+    "distance": "km",
+    **{part: "Wh" for part in ENERGY_PARTS},
+}
 
 
 @dataclass
@@ -171,12 +204,17 @@ def _float_rows(rows: Mapping[Any, Any]) -> dict[str, float]:
 
 @dataclass
 class DrivingMeter:
-    """Driving energy (Wh) and distance (km) totals of one vehicle."""
+    """Driving energy (Wh), its parts (Wh) and distance (km) of one vehicle."""
 
     energy: DailyTotal = field(default_factory=DailyTotal)
     distance: DailyTotal = field(default_factory=DailyTotal)
     odometer_at_start_km: float | None = None
     api_wh_per_km_at_start: float | None = None
+    energy_motor: DailyTotal = field(default_factory=DailyTotal)
+    energy_climate: DailyTotal = field(default_factory=DailyTotal)
+    energy_electronics: DailyTotal = field(default_factory=DailyTotal)
+    energy_battery_care: DailyTotal = field(default_factory=DailyTotal)
+    energy_regenerated: DailyTotal = field(default_factory=DailyTotal)
     # The API's energy total over a rolling 90-day window. Its per-month
     # breakdown (not exposed by the library) shows the oldest month shrinking
     # day by day, so it is not whole calendar months.
@@ -215,6 +253,19 @@ class DrivingMeter:
             )
         # Not short-circuited: both totals must see every poll.
         return self.distance.update(distance_rows, now) or changed
+
+    def update_parts(
+        self,
+        part_rows: Mapping[EnergyPart, Mapping[date, float] | None],
+        now: datetime,
+    ) -> bool:
+        """Apply the latest daily rows of the energy parts."""
+        changed = False
+        for part, rows in part_rows.items():
+            total: DailyTotal = getattr(self, part)
+            # Not short-circuited: every part must see every poll.
+            changed = total.update(rows, now) or changed
+        return changed
 
     def _check_window(self, window_wh: float, counted_wh: float) -> bool:
         """Add growth of the 90-day total beyond ``counted_wh`` to ``missed_wh``.
@@ -263,6 +314,7 @@ class DrivingMeter:
             distance=DailyTotal.from_dict(data.get("distance", {})),
             odometer_at_start_km=data.get("odometer_at_start_km"),
             api_wh_per_km_at_start=data.get("api_wh_per_km_at_start"),
+            **{part: DailyTotal.from_dict(data.get(part, {})) for part in ENERGY_PARTS},
             window_wh=data.get("window_wh"),
             window_carry_wh=float(data.get("window_carry_wh", 0.0)),
             missed_wh=float(data.get("missed_wh", 0.0)),
@@ -312,17 +364,29 @@ def backfill_statistics(total: DailyTotal, tz: tzinfo) -> Backfill | None:
     return Backfill(rows, running, meter_start)
 
 
-def daily_rows(vehicle: Vehicle) -> dict[date, float] | None:
-    """Return the vehicle's daily driving energy rows (Wh) keyed by date."""
+def daily_rows(
+    vehicle: Vehicle, attribute: str = "total_consumed"
+) -> dict[date, float] | None:
+    """Return the vehicle's daily rows (Wh) of an energy attribute by date."""
     stats = vehicle.daily_stats
     if not stats:
         return None
     rows: dict[date, float] = {}
     for day in stats:
-        if day.date is None or day.total_consumed is None:
+        value = getattr(day, attribute)
+        if day.date is None or value is None:
             continue
-        rows[day.date.date()] = float(day.total_consumed)
+        rows[day.date.date()] = float(value)
     return rows or None
+
+
+def daily_part_rows(
+    vehicle: Vehicle,
+) -> dict[EnergyPart, dict[date, float] | None]:
+    """Return the vehicle's daily rows (Wh) of each energy part."""
+    return {
+        part: daily_rows(vehicle, attribute) for part, attribute in ENERGY_PARTS.items()
+    }
 
 
 def daily_distance_rows(vehicle: Vehicle) -> dict[date, float] | None:
@@ -407,8 +471,10 @@ class DrivingMeterTracker:
         before = self.meter
         missed = before.missed_wh if before is not None else 0.0
         energy_rows = daily_rows(self._vehicle)
-        if not await self._async_change(
-            lambda meter: meter.update(
+        part_rows = daily_part_rows(self._vehicle)
+
+        def update(meter: DrivingMeter) -> bool:
+            changed = meter.update(
                 energy_rows,
                 daily_distance_rows(self._vehicle),
                 now,
@@ -416,7 +482,10 @@ class DrivingMeterTracker:
                 odometer_km(self._vehicle),
                 self._vehicle.power_consumption_30d,
             )
-        ):
+            # Not short-circuited: the parts must see every poll.
+            return meter.update_parts(part_rows, now) or changed
+
+        if not await self._async_change(update):
             _LOGGER.debug(
                 "%s: driving meters unchanged (%d daily rows)",
                 self._vehicle.name,

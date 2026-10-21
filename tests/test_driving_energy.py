@@ -19,6 +19,8 @@ from custom_components.kia_uvo.driving_energy import (
     DrivingMeterTracker,
     backfill_statistics,
     daily_distance_rows,
+    daily_part_rows,
+    daily_rows,
 )
 from tests.conftest import make_coordinator, make_hass
 
@@ -165,8 +167,117 @@ def test_lifetime_estimate() -> None:
 def test_round_trip() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), None, NOW)
+    meter.update_parts({"energy_climate": rows(d20261006=400)}, NOW)
     meter.energy.mark_backdated({"2026-10-05": 400})
     assert DrivingMeter.from_dict(meter.as_dict()) == meter
+
+
+CONSUMED_PARTS = (
+    "energy_motor",
+    "energy_climate",
+    "energy_electronics",
+    "energy_battery_care",
+)
+
+
+def test_consumed_parts_add_up_to_the_energy() -> None:
+    # Rows of 2026-10-17 to 19 from the 30-day response, with each day
+    # growing trip by trip and 18 Oct revised a day late.
+    tracker_vehicle = ev(None)
+    meter = DrivingMeter()
+
+    def poll(now: datetime, *days: DailyDrivingStats) -> None:
+        tracker_vehicle.daily_stats = list(days)
+        meter.update(daily_rows(tracker_vehicle), None, now)
+        meter.update_parts(daily_part_rows(tracker_vehicle), now)
+
+    oct17 = day(2026, 10, 17, 9694, 1098, 430, 0, 3622)
+    poll(datetime(2026, 10, 18, 8, tzinfo=TZ), oct17)
+    poll(
+        datetime(2026, 10, 18, 20, tzinfo=TZ),
+        oct17,
+        day(2026, 10, 18, 4000, 500, 300, 0, 2000),
+    )
+    poll(
+        datetime(2026, 10, 19, 21, tzinfo=TZ),
+        oct17,
+        day(2026, 10, 18, 6056, 819, 490, 0, 2710),
+        day(2026, 10, 19, 25328, 1226, 680, 0, 3312),
+    )
+
+    for attribute in ("total", "measured"):
+        assert sum(
+            getattr(getattr(meter, part), attribute) for part in CONSUMED_PARTS
+        ) == getattr(meter.energy, attribute)
+    for attribute in ("late", "baseline_rows"):
+        assert_sums(
+            [getattr(getattr(meter, part), attribute) for part in CONSUMED_PARTS],
+            getattr(meter.energy, attribute),
+        )
+    assert meter.energy.total == 4800 + 27234
+    assert meter.energy.late == {"2026-10-18": 2565}
+    assert meter.energy_regenerated.total == 2000 + 3312
+    assert meter.energy_regenerated.late == {"2026-10-18": 710}
+
+
+def assert_sums(parts: list[dict[str, float]], total: dict[str, float]) -> None:
+    assert {key: sum(part.get(key, 0.0) for part in parts) for key in total} == total
+
+
+def day(
+    year: int,
+    month: int,
+    day_: int,
+    motor: int,
+    climate: int,
+    electronics: int,
+    battery_care: int,
+    regenerated: int,
+) -> DailyDrivingStats:
+    return DailyDrivingStats(
+        date=datetime(year, month, day_),
+        total_consumed=motor + climate + electronics + battery_care,
+        engine_consumption=motor,
+        climate_consumption=climate,
+        onboard_electronics_consumption=electronics,
+        battery_care_consumption=battery_care,
+        regenerated_energy=regenerated,
+    )
+
+
+def test_part_rows_skip_days_without_the_part() -> None:
+    vehicle = ev(None)
+    vehicle.daily_stats = [
+        day(2026, 10, 6, 900, 50, 40, 10, 200),
+        DailyDrivingStats(date=datetime(2026, 10, 7), total_consumed=100),
+    ]
+    assert daily_part_rows(vehicle) == {
+        "energy_motor": {date(2026, 10, 6): 900},
+        "energy_climate": {date(2026, 10, 6): 50},
+        "energy_electronics": {date(2026, 10, 6): 40},
+        "energy_battery_care": {date(2026, 10, 6): 10},
+        "energy_regenerated": {date(2026, 10, 6): 200},
+    }
+
+
+async def test_parts_start_on_their_own_next_to_a_running_meter() -> None:
+    meter = started_meter()
+    meter.update(rows(d20261005=26762, d20261006=13089, d20261008=1000), None, NOW)
+    store = FakeStore(meter.as_dict() | {"energy_motor": {}})
+    del store.data["energy_climate"]  # type: ignore[index]
+    vehicle = ev(rows(d20261005=26762, d20261006=13089, d20261008=1500))
+    tracker = DrivingMeterTracker(store, vehicle, lambda: NOW)
+    await tracker.async_load()
+    await tracker.async_process()
+    assert tracker.meter is not None
+    assert tracker.meter.energy.total == 1500
+    assert tracker.meter.energy_motor.initialized
+    assert tracker.meter.energy_motor.total == 0
+    assert tracker.meter.energy_climate.baseline_rows == {
+        "2026-10-05": 1070,
+        "2026-10-06": 524,
+        "2026-10-08": 60,
+    }
 
 
 def window_meter() -> DrivingMeter:
@@ -282,6 +393,11 @@ def ev(day_rows: dict[date, float] | None) -> Vehicle:
             DailyDrivingStats(
                 date=datetime(d.year, d.month, d.day),
                 total_consumed=wh,
+                engine_consumption=wh - round(wh * 0.04) - round(wh * 0.03),
+                climate_consumption=round(wh * 0.04),
+                onboard_electronics_consumption=round(wh * 0.03),
+                battery_care_consumption=0,
+                regenerated_energy=round(wh * 0.15),
                 distance=round(wh / 160),
             )
             for d, wh in day_rows.items()
@@ -375,6 +491,25 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
         and entity.entity_description.key == "total_power_consumed"
     )
     assert window.state_class is None
+
+    parts = {
+        entity.unique_id: entity
+        for entity in created
+        if isinstance(entity, sensor_platform.DrivingEnergyPartSensor)
+    }
+    assert sorted(parts) == [
+        "kia_uvo_v1_driving_energy_battery_care",
+        "kia_uvo_v1_driving_energy_climate",
+        "kia_uvo_v1_driving_energy_electronics",
+        "kia_uvo_v1_driving_energy_motor",
+        "kia_uvo_v1_driving_energy_regenerated",
+    ]
+    for unique_id, part in parts.items():
+        assert part.translation_key == unique_id.removeprefix("kia_uvo_v1_")
+        assert part.state_class == SensorStateClass.TOTAL
+        assert part.device_class == "energy"
+        assert part.native_unit_of_measurement == "Wh"
+        assert part.native_value == 0
 
 
 def test_backfill_starts_at_zero_before_first_state() -> None:
@@ -480,9 +615,13 @@ async def _started_sensors(
         has_short_term_statistics,
     )
     sensors = {
-        type(e).__name__: e
+        (
+            f"part_{e._quantity}"
+            if isinstance(e, sensor_platform.DrivingEnergyPartSensor)
+            else type(e).__name__
+        ): e
         for e in created
-        if type(e).__name__ in ("DrivingEnergySensor", "DrivingDistanceSensor")
+        if isinstance(e, sensor_platform.DrivingTotalSensor)
     }
     for name, sensor in sensors.items():
         sensor.hass = MagicMock()
@@ -492,7 +631,7 @@ async def _started_sensors(
     monkeypatch.setattr(
         sensor_platform.DrivingTotalSensor,
         "unit_of_measurement",
-        property(lambda self: "kWh" if self._quantity == "energy" else "km"),
+        property(lambda self: "kWh" if self._native_unit == "Wh" else "km"),
     )
     return sensors, imported, fake_recorder
 
@@ -525,6 +664,12 @@ async def test_sensor_imports_backfill_once(monkeypatch: pytest.MonkeyPatch) -> 
     metadata, stats = imported[1]
     assert metadata["unit_class"] == "distance"
     assert [s["sum"] for s in stats] == [167, 249]
+
+    await sensors["part_energy_climate"]._async_update_statistics()
+    metadata, stats = imported[2]
+    assert metadata["statistic_id"] == "sensor.ev6_part_energy_climate"
+    assert metadata["unit_class"] == "energy"
+    assert [s["sum"] for s in stats] == [1.07, pytest.approx(1.594)]
 
 
 async def test_sensor_waits_for_short_term_statistics(

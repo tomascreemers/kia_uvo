@@ -47,8 +47,10 @@ from .const import (
 )
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
 from .driving_energy import (
+    ENERGY_PARTS,
     DailyTotal,
     DrivingMeterTracker,
+    EnergyPart,
     Quantity,
     backfill_statistics,
 )
@@ -635,7 +637,7 @@ async def _async_driving_energy_entities(
     coordinator: HyundaiKiaConnectDataUpdateCoordinator,
     vehicle: Vehicle,
 ) -> list[SensorEntity]:
-    """Set up the driving energy and distance meters and the lifetime estimate."""
+    """Set up the driving meters and the lifetime energy estimate."""
     tracker = DrivingMeterTracker(
         Store[dict[str, Any]](
             hass,
@@ -665,6 +667,10 @@ async def _async_driving_energy_entities(
             tracker,
             # kWh/100 km equals 10 Wh/km.
             average * 10 if average else None,
+        ),
+        *(
+            DrivingEnergyPartSensor(coordinator, vehicle, tracker, part)
+            for part in ENERGY_PARTS
         ),
     ]
 
@@ -890,9 +896,32 @@ class DrivingEnergySensor(DrivingTotalSensor):
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_suggested_display_precision = 2
-    _quantity = "energy"
+    _quantity: Quantity = "energy"
     _converter = EnergyConverter
     _native_unit = UnitOfEnergy.WATT_HOUR
+
+
+class DrivingEnergyPartSensor(DrivingEnergySensor):
+    """One part of the driving energy, for statistics.
+
+    The motor, climate, electronics and battery care meters add up to the
+    driving energy, so they can be its downstream devices in the energy
+    dashboard. The regenerated energy is not part of it.
+    """
+
+    def __init__(
+        self,
+        coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+        vehicle: Vehicle,
+        tracker: DrivingMeterTracker,
+        part: EnergyPart,
+    ) -> None:
+        """Initialize the sensor."""
+        self._quantity = part
+        self._attr_translation_key = f"driving_{part}"
+        super().__init__(coordinator, vehicle, tracker)
+        if part == "energy_regenerated":
+            self._attr_icon = "mdi:battery-arrow-up"
 
 
 class DrivingDistanceSensor(DrivingTotalSensor):
