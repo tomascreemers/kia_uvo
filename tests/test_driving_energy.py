@@ -169,61 +169,66 @@ def test_round_trip() -> None:
     assert DrivingMeter.from_dict(meter.as_dict()) == meter
 
 
-def months_meter() -> DrivingMeter:
+def window_meter() -> DrivingMeter:
     meter = DrivingMeter()
-    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, months_wh=962025)
+    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, window_wh=962025)
     return meter
 
 
-def test_months_total_matching_the_daily_rows_misses_nothing() -> None:
+def test_window_total_matching_the_daily_rows_misses_nothing() -> None:
     # Recorded 2026-10-10: both grew by 7155 + 221 Wh.
-    meter = months_meter()
+    meter = window_meter()
     saturday = datetime(2026, 10, 10, 9, tzinfo=TZ)
     meter.update(
         rows(d20261006=25516, d20261008=26620, d20261010=221),
         None,
         saturday,
-        months_wh=969401,
+        window_wh=969401,
     )
     assert meter.missed_wh == 0
-    assert meter.months_wh == 969401
+    assert meter.window_wh == 969401
 
 
-def test_months_total_growing_beyond_the_daily_rows_is_missed() -> None:
-    # A trip from 40 days ago arrives with today's drive: only the monthly
+def test_window_total_growing_beyond_the_daily_rows_is_missed() -> None:
+    # A trip from 40 days ago arrives with today's drive: only the 90-day
     # total shows it.
-    meter = months_meter()
+    meter = window_meter()
     meter.update(
-        rows(d20261006=25516, d20261008=19465), None, NOW, months_wh=962025 + 5000
+        rows(d20261006=25516, d20261008=19465), None, NOW, window_wh=962025 + 5000
     )
     assert meter.missed_wh == 5000
 
 
 def test_trip_between_the_two_requests_is_not_missed() -> None:
-    meter = months_meter()
-    # Monthly total fetched just before the trip arrived, daily rows after.
-    meter.update(rows(d20261006=25516, d20261008=20465), None, NOW, months_wh=962025)
-    meter.update(rows(d20261006=25516, d20261008=20465), None, NOW, months_wh=963025)
+    meter = window_meter()
+    # 90-day total fetched just before the trip arrived, daily rows after.
+    meter.update(rows(d20261006=25516, d20261008=20465), None, NOW, window_wh=962025)
+    meter.update(rows(d20261006=25516, d20261008=20465), None, NOW, window_wh=963025)
     assert meter.missed_wh == 0
-    assert meter.months_carry_wh == 0
+    assert meter.window_carry_wh == 0
 
 
-def test_month_dropping_out_is_not_missed_and_not_carried_on() -> None:
-    meter = months_meter()
-    november = datetime(2026, 11, 1, 9, tzinfo=TZ)
-    # July drops out of the monthly total.
-    meter.update(rows(d20261008=19465), None, november, months_wh=962025 - 234990)
-    meter.update(rows(d20261008=19465), None, november, months_wh=962025 - 234990)
-    meter.update(
-        rows(d20261008=19465), None, november, months_wh=962025 - 234990 + 3000
-    )
+def test_day_dropping_out_is_not_missed_and_not_carried_on() -> None:
+    meter = window_meter()
+    # The window's oldest day, with 11 kWh of driving, drops out.
+    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, window_wh=951025)
+    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, window_wh=951025)
+    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, window_wh=954025)
     assert meter.missed_wh == 3000
 
 
-def test_months_total_needs_daily_rows() -> None:
-    meter = months_meter()
-    assert not meter.update(None, None, NOW, months_wh=970000)
-    meter.update(rows(d20261006=25516, d20261008=27440), None, NOW, months_wh=970000)
+def test_late_trip_smaller_than_the_day_dropping_out_goes_unnoticed() -> None:
+    meter = window_meter()
+    # 5 kWh reported 40 days late, while 11 kWh drops out of the window.
+    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, window_wh=956025)
+    meter.update(rows(d20261006=25516, d20261008=19465), None, NOW, window_wh=956025)
+    assert meter.missed_wh == 0
+
+
+def test_window_total_needs_daily_rows() -> None:
+    meter = window_meter()
+    assert not meter.update(None, None, NOW, window_wh=970000)
+    meter.update(rows(d20261006=25516, d20261008=27440), None, NOW, window_wh=970000)
     assert meter.missed_wh == 0
 
 
