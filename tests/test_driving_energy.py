@@ -476,9 +476,9 @@ async def _set_up_sensors(
     created: list[Any] = []
     await sensor_platform.async_setup_entry(hass, config_entry, created.extend)
     return {
-        f"driving_{entity._quantity}": entity
+        entity.entity_description.key: entity
         for entity in created
-        if isinstance(entity, sensor_platform.DrivingTotalSensor)
+        if isinstance(entity, sensor_platform.DrivingMeterSensor)
     }
 
 
@@ -501,7 +501,6 @@ async def _started_sensors(
 ) -> tuple[dict[str, Any], list[tuple[Any, list[Any]]], FakeRecorder]:
     """Set up the sensors as added to a hass with a recorder."""
     from homeassistant.components.recorder import statistics as recorder_statistics
-    from homeassistant.helpers import recorder
 
     imported: list[tuple[Any, list[Any]]] = []
     monkeypatch.setattr(
@@ -510,7 +509,7 @@ async def _started_sensors(
         lambda hass, metadata, stats: imported.append((metadata, list(stats))),
     )
     fake_recorder = FakeRecorder()
-    monkeypatch.setattr(recorder, "get_instance", lambda hass: fake_recorder)
+    monkeypatch.setattr(sensor_platform, "get_instance", lambda hass: fake_recorder)
     monkeypatch.setattr(dt_util, "now", lambda: NOW)
     monkeypatch.setattr(dt_util, "get_default_time_zone", lambda: TZ)
     sensors = await _set_up_sensors(monkeypatch, vehicle)
@@ -519,12 +518,12 @@ async def _started_sensors(
         return compiled
 
     monkeypatch.setattr(
-        sensor_platform.DrivingTotalSensor,
+        sensor_platform.DrivingMeterSensor,
         "_async_has_short_term_statistics",
         has_short_term_statistics,
     )
     monkeypatch.setattr(
-        sensor_platform.DrivingTotalSensor,
+        sensor_platform.DrivingMeterSensor,
         "unit_of_measurement",
         property(lambda self: "kWh" if self.device_class == "energy" else "km"),
     )
