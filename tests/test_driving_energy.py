@@ -250,6 +250,14 @@ def test_lifetime_estimate() -> None:
     assert DrivingMeter().lifetime_estimate_wh(185.0) is None
 
 
+def test_meter_saved_before_the_estimate_loads() -> None:
+    data = started_meter().as_dict()
+    del data["odometer_at_start_km"], data["api_wh_per_km_at_start"]
+    meter = DrivingMeter.from_dict(data)
+    # The odometer at its start is unknown, so it gets no estimate.
+    assert meter.lifetime_estimate_wh(185.0) is None
+
+
 def test_round_trip() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), {}, NOW)
