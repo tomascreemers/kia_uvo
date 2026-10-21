@@ -27,9 +27,9 @@ continues the sum from the sensor's last short-term row, so the sensor shifts
 the rows compiled since the meter started up by that total.
 
 Each daily row also splits its energy into the motor, climate, electronics
-and battery care parts, which add up to the row's total, and reports the
-regenerated energy, which is not part of that total. Each part is a meter of
-its own, kept exactly like the total.
+and battery care parts, which add up to the row's total. Each part is a meter
+of its own, kept exactly like the total. The motor part is net of the
+regenerated energy, which the row reports separately.
 
 Driving reported more than ~30 days late never shows up as a daily row, so
 the meters cannot count it. It is only detected: the API's rolling 90-day
@@ -69,23 +69,20 @@ Quantity = Literal[
     "energy_climate",
     "energy_electronics",
     "energy_battery_care",
-    "energy_regenerated",
 ]
 EnergyPart = Literal[
     "energy_motor",
     "energy_climate",
     "energy_electronics",
     "energy_battery_care",
-    "energy_regenerated",
 ]
-# Each part's ``DailyDrivingStats`` attribute. All but the regenerated energy
-# add up to ``total_consumed``.
+# Each part's ``DailyDrivingStats`` attribute. They add up to
+# ``total_consumed``.
 ENERGY_PARTS: dict[EnergyPart, str] = {
     "energy_motor": "engine_consumption",
     "energy_climate": "climate_consumption",
     "energy_electronics": "onboard_electronics_consumption",
     "energy_battery_care": "battery_care_consumption",
-    "energy_regenerated": "regenerated_energy",
 }
 QUANTITY_UNITS: dict[Quantity, str] = {
     "energy": "Wh",
@@ -212,7 +209,6 @@ class DrivingMeter:
     energy_climate: DailyTotal = field(default_factory=DailyTotal)
     energy_electronics: DailyTotal = field(default_factory=DailyTotal)
     energy_battery_care: DailyTotal = field(default_factory=DailyTotal)
-    energy_regenerated: DailyTotal = field(default_factory=DailyTotal)
     # The API's energy total over a rolling 90-day window. Its per-month
     # breakdown (not exposed by the library) shows the oldest month shrinking
     # day by day, so it is not whole calendar months.
