@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Final, cast
 
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import (
+    async_import_statistics,
+    get_last_short_term_statistics,
+)
 from homeassistant.components.sensor import (
     RestoreSensor,
     SensorDeviceClass,
@@ -16,6 +25,7 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
+from homeassistant.components.sensor.const import UNIT_CONVERTERS
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
@@ -28,14 +38,10 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.recorder import get_instance
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import StateType
 from homeassistant.util import dt as dt_util
-from homeassistant.util.unit_conversion import (
-    BaseUnitConverter,
-    DistanceConverter,
-    EnergyConverter,
-)
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import ENGINE_TYPES
 
@@ -50,7 +56,6 @@ from .driving_energy import (
     ENERGY_PARTS,
     DailyTotal,
     DrivingMeterTracker,
-    EnergyPart,
     Quantity,
     backfill_statistics,
 )
@@ -609,9 +614,11 @@ async def async_setup_entry(
                     coordinator, coordinator.vehicle_manager.vehicles[vehicle_id]
                 )
             )
+        # The meters need daily_stats to hold one row per day, as in the
+        # regions that also report the 90-day total. Elsewhere it holds trips.
         if vehicle.total_power_consumed is not None:
             entities.extend(
-                await _async_driving_energy_entities(
+                await _async_driving_meter_sensors(
                     hass, config_entry, coordinator, vehicle
                 )
             )
@@ -631,36 +638,90 @@ async def async_setup_entry(
 PARALLEL_UPDATES = 0
 
 
-async def _async_driving_energy_entities(
+@dataclass(frozen=True, kw_only=True)
+class DrivingMeterSensorEntityDescription(SensorEntityDescription):
+    """Describes a driving meter sensor."""
+
+    quantity: Quantity
+    native_unit_of_measurement: str
+
+
+DRIVING_METER_DESCRIPTIONS: Final[tuple[DrivingMeterSensorEntityDescription, ...]] = (
+    DrivingMeterSensorEntityDescription(
+        key="driving_energy",
+        translation_key="driving_energy",
+        quantity="energy",
+        icon="mdi:car-electric",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_display_precision=2,
+    ),
+    # Built from the same daily rows as the energy, so both cover the same
+    # trips and are booked on the same days. The API reports whole kilometres
+    # per day.
+    DrivingMeterSensorEntityDescription(
+        key="driving_distance",
+        translation_key="driving_distance",
+        quantity="distance",
+        icon="mdi:map-marker-distance",
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.TOTAL,
+        native_unit_of_measurement=UnitOfLength.KILOMETERS,
+        suggested_display_precision=0,
+    ),
+    # The motor, climate, electronics and battery care parts add up to the
+    # driving energy, so they can be its downstream devices in the energy
+    # dashboard. The motor part is net of the regenerated energy, which is a
+    # meter of its own and not part of the driving energy.
+    *(
+        DrivingMeterSensorEntityDescription(
+            key=f"driving_{part}",
+            translation_key=f"driving_{part}",
+            quantity=part,
+            icon=(
+                "mdi:battery-arrow-up"
+                if part == "energy_regenerated"
+                else "mdi:car-electric"
+            ),
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL,
+            native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            suggested_display_precision=2,
+        )
+        for part in ENERGY_PARTS
+    ),
+)
+
+
+async def _async_driving_meter_sensors(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     coordinator: HyundaiKiaConnectDataUpdateCoordinator,
     vehicle: Vehicle,
 ) -> list[SensorEntity]:
-    """Set up the driving meters and the lifetime energy estimate."""
-    tracker = DrivingMeterTracker(
-        Store[dict[str, Any]](
-            hass,
-            DRIVING_ENERGY_STORAGE_VERSION,
-            f"{DOMAIN}.driving_energy.{vehicle.id}",
-        ),
-        vehicle,
-        dt_util.now,
+    """Set up the driving meters and the lifetime estimate built on them."""
+    store: Store[dict[str, Any]] = Store(
+        hass, DRIVING_ENERGY_STORAGE_VERSION, f"{DOMAIN}.driving_energy.{vehicle.id}"
     )
-    await tracker.async_load()
+    tracker = await DrivingMeterTracker.async_load(store, vehicle, dt_util.now)
     await tracker.async_process()
 
     @callback
     def _schedule_process() -> None:
         hass.async_create_task(
-            tracker.async_process(), f"{DOMAIN} driving energy {vehicle.id}"
+            tracker.async_process(), f"{DOMAIN} driving meters {vehicle.id}"
         )
 
     config_entry.async_on_unload(coordinator.async_add_listener(_schedule_process))
     average: float | None = config_entry.options.get(CONF_LIFETIME_AVERAGE_CONSUMPTION)
     return [
-        DrivingEnergySensor(coordinator, vehicle, tracker),
-        DrivingDistanceSensor(coordinator, vehicle, tracker),
+        *(
+            DrivingMeterSensor(coordinator, vehicle, tracker, description)
+            for description in DRIVING_METER_DESCRIPTIONS
+        ),
         LifetimeDrivingEnergyEstimateSensor(
             coordinator,
             vehicle,
@@ -668,14 +729,10 @@ async def _async_driving_energy_entities(
             # kWh/100 km equals 10 Wh/km.
             average * 10 if average else None,
         ),
-        *(
-            DrivingEnergyPartSensor(coordinator, vehicle, tracker, part)
-            for part in ENERGY_PARTS
-        ),
     ]
 
 
-class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
+class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
     """A total built from the daily driving rows, for statistics.
 
     A change to the current day's row moves the state, so it lands in the
@@ -684,31 +741,45 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
     state leaves it out: the recorder would otherwise book it again now.
     """
 
-    _attr_state_class = SensorStateClass.TOTAL
-    _quantity: Quantity
-    _converter: type[BaseUnitConverter]
-    _native_unit: str
+    entity_description: DrivingMeterSensorEntityDescription
 
     def __init__(
         self,
         coordinator: HyundaiKiaConnectDataUpdateCoordinator,
         vehicle: Vehicle,
         tracker: DrivingMeterTracker,
+        description: DrivingMeterSensorEntityDescription,
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, vehicle)
+        self.entity_description = description
+        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_{description.key}"
         self._tracker = tracker
         self._statistics_lock = asyncio.Lock()
-        self._attr_native_unit_of_measurement = self._native_unit
-        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_driving_{self._quantity}"
 
-    def _total(self) -> DailyTotal | None:
-        """Return this sensor's total, or None until it has started."""
-        meter = self._tracker.meter
-        if meter is None:
-            return None
-        total: DailyTotal = getattr(meter, self._quantity)
-        return total if total.initialized else None
+    @property
+    def _daily_total(self) -> DailyTotal:
+        return self._tracker.meter.daily_total(self.entity_description.quantity)
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the meter reading, or None until the meter has started."""
+        total = self._daily_total
+        return total.total if total.initialized else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return what was booked outside the state."""
+        total = self._daily_total
+        if total.started_at is None:
+            return {}
+        unit = self.entity_description.native_unit_of_measurement.lower()
+        return {
+            "measured_since": total.started_at.date().isoformat(),
+            f"booked_on_earlier_days_{unit}": round(
+                total.backdated + sum(total.late.values()), 3
+            ),
+        }
 
     async def async_added_to_hass(self) -> None:
         """Publish whenever the tracker has saved a change."""
@@ -730,15 +801,13 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
 
     @callback
     def _schedule_statistics_update(self) -> None:
-        total = self._total()
-        if total is not None and (not total.backfilled or total.late):
+        if self._daily_total.statistics_pending:
             self.hass.async_create_task(
-                self._async_update_statistics(),
-                f"{DOMAIN} driving {self._quantity} statistics",
+                self._async_update_statistics(), f"{DOMAIN} {self.entity_id} statistics"
             )
 
     async def _async_update_statistics(self) -> None:
-        """Import the days before the meter once, then move in late changes.
+        """Import the days before the meter once, then book the late changes.
 
         Both go into this sensor's own statistics, as changes to the sums
         from a given hour onwards. The recorder continues the sum from the
@@ -755,41 +824,29 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
         if "recorder" not in self.hass.config.components:
             return
         async with self._statistics_lock:
-            total = self._total()
-            if total is None or (total.backfilled and not total.late):
+            # A snapshot: the tracker replaces its meter on every change.
+            total = self._daily_total
+            if not total.statistics_pending:
                 return
             if not await self._async_has_short_term_statistics():
                 _LOGGER.debug(
-                    "%s has no short-term statistics yet; the %s wait for them",
+                    "%s has no short-term statistics yet; its backfill and late "
+                    "changes wait for them",
                     self.entity_id,
-                    "backfill"
-                    if not total.backfilled
-                    else f"late changes {total.late}",
                 )
                 return
+            quantity = self.entity_description.quantity
             if not total.backfilled:
                 self._import_backfill(total)
                 await self._async_recorder_commit()
-                await self._tracker.async_mark_backfilled(self._quantity)
-            if total.late:
-                applied = dict(total.late)
-                self._adjust_late(total, applied)
+                await self._tracker.async_mark_backfilled(quantity)
+            if late := dict(total.late):
+                self._book_late(total, late)
                 await self._async_recorder_commit()
-                await self._tracker.async_mark_backdated(self._quantity, applied)
-
-    async def _async_recorder_commit(self) -> None:
-        """Wait until the recorder has committed the jobs queued so far."""
-        from homeassistant.helpers.recorder import get_instance
-
-        if future := get_instance(self.hass).async_get_commit_future():
-            await future
+                await self._tracker.async_mark_backdated(quantity, late)
 
     async def _async_has_short_term_statistics(self) -> bool:
-        from homeassistant.components.recorder.statistics import (
-            get_last_short_term_statistics,
-        )
-        from homeassistant.helpers.recorder import get_instance
-
+        """Return True once the recorder has compiled statistics for this sensor."""
         last = await get_instance(self.hass).async_add_executor_job(
             get_last_short_term_statistics,
             self.hass,
@@ -800,146 +857,68 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
         )
         return bool(last.get(self.entity_id))
 
-    def _import_backfill(self, total: DailyTotal) -> None:
-        """Import the days before the meter and shift the compiled sums.
+    async def _async_recorder_commit(self) -> None:
+        """Wait until the recorder has committed the jobs queued so far."""
+        if future := get_instance(self.hass).async_get_commit_future():
+            await future
 
+    def _import_backfill(self, total: DailyTotal) -> None:
+        """Import the days before the meter, then shift the compiled sums.
+
+        The recorder started this sensor's sums at 0, so the sums compiled
+        since the meter started are shifted up by the imported total.
         Re-importing replaces rows of an earlier import at the same hours.
         """
-        # Imported lazily: the recorder is only needed for statistics jobs.
-        from homeassistant.components.recorder.models import (
-            StatisticData,
-            StatisticMeanType,
-            StatisticMetaData,
-        )
-        from homeassistant.components.recorder.statistics import (
-            async_import_statistics,
-        )
-        from homeassistant.helpers.recorder import get_instance
-
         backfill = backfill_statistics(total, dt_util.get_default_time_zone())
         if backfill is None or not backfill.rows:
             return
-        unit = self.unit_of_measurement or self._native_unit
+        native_unit = self.entity_description.native_unit_of_measurement
+        # Statistics are kept in the unit of the state, which need not be the
+        # native one.
+        unit = self.unit_of_measurement
+        converter = UNIT_CONVERTERS[self.device_class]
         metadata: StatisticMetaData = {
             "mean_type": StatisticMeanType.NONE,
             "has_sum": True,
             "name": None,
             "source": "recorder",
             "statistic_id": self.entity_id,
-            "unit_class": self._converter.UNIT_CLASS,
+            "unit_class": converter.UNIT_CLASS,
             "unit_of_measurement": unit,
         }
         statistics: list[StatisticData] = [
-            {
-                "start": start,
-                "sum": self._converter.convert(value, self._native_unit, unit),
-            }
-            for start, value in backfill.rows
+            {"start": hour, "sum": converter.convert(value, native_unit, unit)}
+            for hour, value in backfill.rows
         ]
         async_import_statistics(self.hass, metadata, statistics)
         get_instance(self.hass).async_adjust_statistics(
-            self.entity_id, backfill.meter_start, backfill.total, self._native_unit
+            self.entity_id, backfill.meter_start, backfill.total, native_unit
         )
         _LOGGER.info(
             "Imported %d days of driving %s before %s into %s",
             len(backfill.rows),
-            self._quantity,
+            self.entity_description.quantity,
             total.started_at,
             self.entity_id,
         )
 
-    def _adjust_late(self, total: DailyTotal, late: dict[str, float]) -> None:
-        from homeassistant.helpers.recorder import get_instance
-
+    def _book_late(self, total: DailyTotal, late: Mapping[date, float]) -> None:
+        """Add late changes to the statistics of the days they belong to."""
         recorder = get_instance(self.hass)
+        native_unit = self.entity_description.native_unit_of_measurement
         tz = dt_util.get_default_time_zone()
-        for key, value in sorted(late.items()):
-            hour = total.late_hour(key, tz)
-            recorder.async_adjust_statistics(
-                self.entity_id, hour, value, self._native_unit
-            )
+        for day, value in sorted(late.items()):
+            hour = total.late_hour(day, tz)
+            recorder.async_adjust_statistics(self.entity_id, hour, value, native_unit)
             _LOGGER.info(
                 "Booked %s %s of driving %s reported late for %s at %s in %s",
                 value,
-                self._native_unit,
-                self._quantity,
-                key,
+                native_unit,
+                self.entity_description.quantity,
+                day,
                 hour.isoformat(),
                 self.entity_id,
             )
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the current-day total, or None until the meter has started."""
-        total = self._total()
-        return total.total if total is not None else None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return what was booked outside the state."""
-        total = self._total()
-        if total is None:
-            return {}
-        return {
-            "measured_since": total.started,
-            f"booked_on_earlier_days_{self._native_unit.lower()}": round(
-                total.backdated + sum(total.late.values()), 3
-            ),
-        }
-
-
-class DrivingEnergySensor(DrivingTotalSensor):
-    """Driving energy measured since the meter started, for statistics."""
-
-    _attr_translation_key = "driving_energy"
-    _attr_icon = "mdi:car-electric"
-    _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    _attr_suggested_display_precision = 2
-    _quantity: Quantity = "energy"
-    _converter = EnergyConverter
-    _native_unit = UnitOfEnergy.WATT_HOUR
-
-
-class DrivingEnergyPartSensor(DrivingEnergySensor):
-    """One part of the driving energy, for statistics.
-
-    The motor, climate, electronics and battery care meters add up to the
-    driving energy, so they can be its downstream devices in the energy
-    dashboard. The motor part is net of the regenerated energy, which is a
-    meter of its own and not part of the driving energy.
-    """
-
-    def __init__(
-        self,
-        coordinator: HyundaiKiaConnectDataUpdateCoordinator,
-        vehicle: Vehicle,
-        tracker: DrivingMeterTracker,
-        part: EnergyPart,
-    ) -> None:
-        """Initialize the sensor."""
-        self._quantity = part
-        self._attr_translation_key = f"driving_{part}"
-        super().__init__(coordinator, vehicle, tracker)
-        if part == "energy_regenerated":
-            self._attr_icon = "mdi:battery-arrow-up"
-
-
-class DrivingDistanceSensor(DrivingTotalSensor):
-    """Driving distance measured since the meter started, for statistics.
-
-    Built from the same daily rows as the energy, so both cover the same
-    trips and are booked on the same days. The API reports whole kilometres
-    per day.
-    """
-
-    _attr_translation_key = "driving_distance"
-    _attr_icon = "mdi:map-marker-distance"
-    _attr_device_class = SensorDeviceClass.DISTANCE
-    _attr_suggested_display_precision = 0
-    _quantity = "distance"
-    _converter = DistanceConverter
-    _native_unit = UnitOfLength.KILOMETERS
 
 
 class LifetimeDrivingEnergyEstimateSensor(SensorEntity, HyundaiKiaConnectEntity):
@@ -978,20 +957,17 @@ class LifetimeDrivingEnergyEstimateSensor(SensorEntity, HyundaiKiaConnectEntity)
     @property
     def native_value(self) -> float | None:
         """Return the estimate, or None when it cannot be made."""
-        meter = self._tracker.meter
-        if meter is None:
-            return None
-        return meter.lifetime_estimate_wh(self._wh_per_km)
+        return self._tracker.meter.lifetime_estimate_wh(self._wh_per_km)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return what the estimate is based on."""
         meter = self._tracker.meter
-        if meter is None or not meter.initialized:
+        if (started_at := meter.energy.started_at) is None:
             return {}
         wh_per_km = self._wh_per_km or meter.api_wh_per_km_at_start
         return {
-            "measured_since": meter.energy.started,
+            "measured_since": started_at.date().isoformat(),
             "odometer_at_start_km": meter.odometer_at_start_km,
             "average_consumption_kwh_per_100km": (
                 round(wh_per_km / 10, 2) if wh_per_km is not None else None
