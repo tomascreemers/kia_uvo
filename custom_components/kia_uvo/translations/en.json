@@ -434,6 +434,9 @@
       "driving_energy_motor": {
         "name": "Driving Energy Motor"
       },
+      "driving_energy_regenerated": {
+        "name": "Driving Energy Regenerated"
+      },
       "dtc_count": {
         "name": "DTC Count"
       },
