@@ -58,6 +58,7 @@ BACKFILL_HOUR = time(12)
 LATE_HOUR = time(23)
 
 Quantity = Literal["energy", "distance"]
+QUANTITY_UNITS: dict[Quantity, str] = {"energy": "Wh", "distance": "km"}
 
 
 @dataclass
@@ -377,14 +378,34 @@ class DrivingMeterTracker:
         """Load the persisted meter."""
         data = await self._store.async_load()
         self.meter = DrivingMeter.from_dict(data) if data else DrivingMeter()
+        if not data:
+            _LOGGER.debug("%s: no stored driving meter yet", self._vehicle.name)
+            return
+        for quantity, unit in QUANTITY_UNITS.items():
+            total: DailyTotal = getattr(self.meter, quantity)
+            _LOGGER.debug(
+                "%s: loaded driving %s meter: total %s %s since %s, %d days of "
+                "rows, backfilled %s, late %s, booked late so far %s",
+                self._vehicle.name,
+                quantity,
+                total.total,
+                unit,
+                total.started_at,
+                len(total.rows),
+                total.backfilled,
+                total.late,
+                total.backdated,
+            )
 
     async def async_process(self) -> None:
         """Apply the vehicle's current rows; save before publishing."""
         now = self._now()
-        missed = self.meter.missed_wh if self.meter is not None else 0.0
+        before = self.meter
+        missed = before.missed_wh if before is not None else 0.0
+        energy_rows = daily_rows(self._vehicle)
         if not await self._async_change(
             lambda meter: meter.update(
-                daily_rows(self._vehicle),
+                energy_rows,
                 daily_distance_rows(self._vehicle),
                 now,
                 self._vehicle.total_power_consumed,
@@ -392,7 +413,14 @@ class DrivingMeterTracker:
                 self._vehicle.power_consumption_30d,
             )
         ):
+            _LOGGER.debug(
+                "%s: driving meters unchanged (%d daily rows)",
+                self._vehicle.name,
+                len(energy_rows or {}),
+            )
             return
+        if before is not None and self.meter is not None:
+            self._log_changes(before, self.meter)
         if self.meter is not None and self.meter.missed_wh > missed:
             _LOGGER.warning(
                 "%s: %.0f Wh of driving was reported for days older than the "
@@ -404,6 +432,52 @@ class DrivingMeterTracker:
             )
         for listener in list(self._listeners):
             listener()
+
+    def _log_changes(self, before: DrivingMeter, after: DrivingMeter) -> None:
+        """Log what one poll changed in each total."""
+        for quantity, unit in QUANTITY_UNITS.items():
+            old: DailyTotal = getattr(before, quantity)
+            new: DailyTotal = getattr(after, quantity)
+            if not old.initialized and new.initialized:
+                _LOGGER.debug(
+                    "%s: driving %s meter started at %s, %d days before it "
+                    "(%s %s) left for the backfill",
+                    self._vehicle.name,
+                    quantity,
+                    new.started_at,
+                    len(new.baseline_rows),
+                    sum(new.baseline_rows.values()),
+                    unit,
+                )
+                continue
+            changes = {
+                key: value - old.rows.get(key, 0.0)
+                for key, value in sorted(new.rows.items())
+                if key not in old.rows or value != old.rows[key]
+            }
+            dropped = sorted(old.rows.keys() - new.rows.keys())
+            if not changes and not dropped:
+                continue
+            _LOGGER.debug(
+                "%s: driving %s rows changed by %s %s, dropped %s; total %s -> %s, "
+                "late %s",
+                self._vehicle.name,
+                quantity,
+                changes,
+                unit,
+                dropped,
+                old.total,
+                new.total,
+                new.late,
+            )
+        if after.months_wh != before.months_wh:
+            _LOGGER.debug(
+                "%s: monthly driving energy total %s -> %s Wh, carried %s Wh",
+                self._vehicle.name,
+                before.months_wh,
+                after.months_wh,
+                after.months_carry_wh,
+            )
 
     async def async_mark_backfilled(self, quantity: Quantity) -> None:
         """Record that the days before ``quantity``'s start were imported."""
