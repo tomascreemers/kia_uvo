@@ -706,7 +706,8 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
         """Publish whenever the tracker has saved a change."""
         await super().async_added_to_hass()
         self.async_on_remove(self._tracker.add_listener(self._handle_meter_change))
-        await self._async_update_statistics()
+        # Not awaited: it waits for the recorder, which can be busy at startup.
+        self._schedule_statistics_update()
 
     @callback
     def _handle_meter_change(self) -> None:
@@ -737,6 +738,11 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
         compiled some: a change made before then would be lost at the next
         compile. The recorder runs its jobs in order, so each change lands on
         top of the previous ones.
+
+        A change is only marked as done once the recorder has committed it:
+        marked earlier, a crash in between would lose it for good. A crash
+        after the commit but before the mark is saved books it twice; that
+        window is a single file write.
         """
         if "recorder" not in self.hass.config.components:
             return
@@ -755,11 +761,20 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
                 return
             if not total.backfilled:
                 self._import_backfill(total)
+                await self._async_recorder_commit()
                 await self._tracker.async_mark_backfilled(self._quantity)
             if total.late:
                 applied = dict(total.late)
                 self._adjust_late(total, applied)
+                await self._async_recorder_commit()
                 await self._tracker.async_mark_backdated(self._quantity, applied)
+
+    async def _async_recorder_commit(self) -> None:
+        """Wait until the recorder has committed the jobs queued so far."""
+        from homeassistant.helpers.recorder import get_instance
+
+        if future := get_instance(self.hass).async_get_commit_future():
+            await future
 
     async def _async_has_short_term_statistics(self) -> bool:
         from homeassistant.components.recorder.statistics import (
