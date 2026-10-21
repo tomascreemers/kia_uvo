@@ -28,8 +28,8 @@ the rows compiled since the meter started up by that total.
 
 Each daily row also splits its energy into the motor, climate, electronics
 and battery care parts, which add up to the row's total, and reports the
-regenerated energy, which is not part of that total. Each part is a meter of
-its own, kept exactly like the total.
+regenerated energy, which the motor part is already net of. Each is a meter
+of its own, kept exactly like the total.
 
 Driving reported more than ~30 days late never shows up as a daily row, so
 the meters cannot count it. It is only detected: the API's rolling 90-day

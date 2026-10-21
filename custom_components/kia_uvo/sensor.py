@@ -891,7 +891,8 @@ class DrivingEnergyPartSensor(DrivingEnergySensor):
 
     The motor, climate, electronics and battery care meters add up to the
     driving energy, so they can be its downstream devices in the energy
-    dashboard. The regenerated energy is not part of it.
+    dashboard. The motor part is net of the regenerated energy, which is a
+    meter of its own and not part of the driving energy.
     """
 
     def __init__(
