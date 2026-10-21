@@ -734,6 +734,13 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
             if total is None or (total.backfilled and not total.late):
                 return
             if not await self._async_has_short_term_statistics():
+                _LOGGER.debug(
+                    "%s has no short-term statistics yet; the %s wait for them",
+                    self.entity_id,
+                    "backfill"
+                    if not total.backfilled
+                    else f"late changes {total.late}",
+                )
                 return
             if not total.backfilled:
                 self._import_backfill(total)
