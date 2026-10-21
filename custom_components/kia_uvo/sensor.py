@@ -906,7 +906,7 @@ class DrivingEnergyPartSensor(DrivingEnergySensor):
 
     The motor, climate, electronics and battery care meters add up to the
     driving energy, so they can be its downstream devices in the energy
-    dashboard. The regenerated energy is not part of it.
+    dashboard.
     """
 
     def __init__(
@@ -920,8 +920,6 @@ class DrivingEnergyPartSensor(DrivingEnergySensor):
         self._quantity = part
         self._attr_translation_key = f"driving_{part}"
         super().__init__(coordinator, vehicle, tracker)
-        if part == "energy_regenerated":
-            self._attr_icon = "mdi:battery-arrow-up"
 
 
 class DrivingDistanceSensor(DrivingTotalSensor):

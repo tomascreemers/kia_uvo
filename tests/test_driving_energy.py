@@ -14,6 +14,7 @@ from hyundai_kia_connect_api.Vehicle import DailyDrivingStats
 from custom_components.kia_uvo import sensor as sensor_platform
 from custom_components.kia_uvo.const import CONF_LIFETIME_AVERAGE_CONSUMPTION
 from custom_components.kia_uvo.driving_energy import (
+    ENERGY_PARTS,
     DailyTotal,
     DrivingMeter,
     DrivingMeterTracker,
@@ -172,15 +173,7 @@ def test_round_trip() -> None:
     assert DrivingMeter.from_dict(meter.as_dict()) == meter
 
 
-CONSUMED_PARTS = (
-    "energy_motor",
-    "energy_climate",
-    "energy_electronics",
-    "energy_battery_care",
-)
-
-
-def test_consumed_parts_add_up_to_the_energy() -> None:
+def test_parts_add_up_to_the_energy() -> None:
     # Rows of 2026-10-17 to 19 from the 30-day response, with each day
     # growing trip by trip and 18 Oct revised a day late.
     tracker_vehicle = ev(None)
@@ -191,33 +184,31 @@ def test_consumed_parts_add_up_to_the_energy() -> None:
         meter.update(daily_rows(tracker_vehicle), None, now)
         meter.update_parts(daily_part_rows(tracker_vehicle), now)
 
-    oct17 = day(2026, 10, 17, 9694, 1098, 430, 0, 3622)
+    oct17 = day(2026, 10, 17, 9694, 1098, 430, 0)
     poll(datetime(2026, 10, 18, 8, tzinfo=TZ), oct17)
     poll(
         datetime(2026, 10, 18, 20, tzinfo=TZ),
         oct17,
-        day(2026, 10, 18, 4000, 500, 300, 0, 2000),
+        day(2026, 10, 18, 4000, 500, 300, 0),
     )
     poll(
         datetime(2026, 10, 19, 21, tzinfo=TZ),
         oct17,
-        day(2026, 10, 18, 6056, 819, 490, 0, 2710),
-        day(2026, 10, 19, 25328, 1226, 680, 0, 3312),
+        day(2026, 10, 18, 6056, 819, 490, 0),
+        day(2026, 10, 19, 25328, 1226, 680, 0),
     )
 
     for attribute in ("total", "measured"):
         assert sum(
-            getattr(getattr(meter, part), attribute) for part in CONSUMED_PARTS
+            getattr(getattr(meter, part), attribute) for part in ENERGY_PARTS
         ) == getattr(meter.energy, attribute)
     for attribute in ("late", "baseline_rows"):
         assert_sums(
-            [getattr(getattr(meter, part), attribute) for part in CONSUMED_PARTS],
+            [getattr(getattr(meter, part), attribute) for part in ENERGY_PARTS],
             getattr(meter.energy, attribute),
         )
     assert meter.energy.total == 4800 + 27234
     assert meter.energy.late == {"2026-10-18": 2565}
-    assert meter.energy_regenerated.total == 2000 + 3312
-    assert meter.energy_regenerated.late == {"2026-10-18": 710}
 
 
 def assert_sums(parts: list[dict[str, float]], total: dict[str, float]) -> None:
@@ -232,7 +223,6 @@ def day(
     climate: int,
     electronics: int,
     battery_care: int,
-    regenerated: int,
 ) -> DailyDrivingStats:
     return DailyDrivingStats(
         date=datetime(year, month, day_),
@@ -241,14 +231,13 @@ def day(
         climate_consumption=climate,
         onboard_electronics_consumption=electronics,
         battery_care_consumption=battery_care,
-        regenerated_energy=regenerated,
     )
 
 
 def test_part_rows_skip_days_without_the_part() -> None:
     vehicle = ev(None)
     vehicle.daily_stats = [
-        day(2026, 10, 6, 900, 50, 40, 10, 200),
+        day(2026, 10, 6, 900, 50, 40, 10),
         DailyDrivingStats(date=datetime(2026, 10, 7), total_consumed=100),
     ]
     assert daily_part_rows(vehicle) == {
@@ -256,7 +245,6 @@ def test_part_rows_skip_days_without_the_part() -> None:
         "energy_climate": {date(2026, 10, 6): 50},
         "energy_electronics": {date(2026, 10, 6): 40},
         "energy_battery_care": {date(2026, 10, 6): 10},
-        "energy_regenerated": {date(2026, 10, 6): 200},
     }
 
 
@@ -397,7 +385,6 @@ def ev(day_rows: dict[date, float] | None) -> Vehicle:
                 climate_consumption=round(wh * 0.04),
                 onboard_electronics_consumption=round(wh * 0.03),
                 battery_care_consumption=0,
-                regenerated_energy=round(wh * 0.15),
                 distance=round(wh / 160),
             )
             for d, wh in day_rows.items()
@@ -502,7 +489,6 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
         "kia_uvo_v1_driving_energy_climate",
         "kia_uvo_v1_driving_energy_electronics",
         "kia_uvo_v1_driving_energy_motor",
-        "kia_uvo_v1_driving_energy_regenerated",
     ]
     for unique_id, part in parts.items():
         assert part.translation_key == unique_id.removeprefix("kia_uvo_v1_")
