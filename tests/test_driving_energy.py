@@ -469,17 +469,13 @@ async def test_tracker_marks_backfilled_and_backdated() -> None:
 async def _set_up_sensors(
     monkeypatch: pytest.MonkeyPatch, vehicle: Vehicle
 ) -> dict[str, Any]:
-    """Return the driving meter sensors by key."""
+    """Return the sensors set up for ``vehicle``, by unique id less its prefix."""
     monkeypatch.setattr(sensor_platform, "Store", lambda *args: FakeStore())
     hass, config_entry = make_hass(make_coordinator(vehicle))
     config_entry.options = {}
     created: list[Any] = []
     await sensor_platform.async_setup_entry(hass, config_entry, created.extend)
-    return {
-        entity.entity_description.key: entity
-        for entity in created
-        if isinstance(entity, sensor_platform.DrivingMeterSensor)
-    }
+    return {entity.unique_id.removeprefix("kia_uvo_v1_"): entity for entity in created}
 
 
 async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -510,7 +506,11 @@ async def _started_sensors(
     monkeypatch.setattr(sensor_platform, "get_instance", lambda hass: fake_recorder)
     monkeypatch.setattr(dt_util, "now", lambda: NOW)
     monkeypatch.setattr(dt_util, "get_default_time_zone", lambda: TZ)
-    sensors = await _set_up_sensors(monkeypatch, vehicle)
+    sensors = {
+        key: sensor
+        for key, sensor in (await _set_up_sensors(monkeypatch, vehicle)).items()
+        if isinstance(sensor, sensor_platform.DrivingMeterSensor)
+    }
 
     async def has_short_term_statistics(self: Any) -> bool:
         return compiled
