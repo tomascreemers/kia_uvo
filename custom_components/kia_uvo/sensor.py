@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Final, cast
@@ -629,16 +629,10 @@ async def _async_driving_energy_entities(
     vehicle: Vehicle,
 ) -> list[SensorEntity]:
     """Set up the driving energy and distance meters."""
-    tracker = DrivingMeterTracker(
-        Store[dict[str, Any]](
-            hass,
-            DRIVING_ENERGY_STORAGE_VERSION,
-            f"{DOMAIN}.driving_energy.{vehicle.id}",
-        ),
-        vehicle,
-        dt_util.now,
+    store: Store[dict[str, Any]] = Store(
+        hass, DRIVING_ENERGY_STORAGE_VERSION, f"{DOMAIN}.driving_energy.{vehicle.id}"
     )
-    await tracker.async_load()
+    tracker = await DrivingMeterTracker.async_load(store, vehicle, dt_util.now)
     await tracker.async_process()
 
     @callback
@@ -683,10 +677,7 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
 
     def _total(self) -> DailyTotal | None:
         """Return this sensor's total, or None until it has started."""
-        meter = self._tracker.meter
-        if meter is None:
-            return None
-        total: DailyTotal = getattr(meter, self._quantity)
+        total = self._tracker.meter.daily_total(self._quantity)
         return total if total.initialized else None
 
     async def async_added_to_hass(self) -> None:
@@ -710,7 +701,7 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
     @callback
     def _schedule_statistics_update(self) -> None:
         total = self._total()
-        if total is not None and (not total.backfilled or total.late):
+        if total is not None and total.statistics_pending:
             self.hass.async_create_task(
                 self._async_update_statistics(),
                 f"{DOMAIN} driving {self._quantity} statistics",
@@ -734,27 +725,25 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
         if "recorder" not in self.hass.config.components:
             return
         async with self._statistics_lock:
+            # A snapshot: the tracker replaces its meter on every change.
             total = self._total()
-            if total is None or (total.backfilled and not total.late):
+            if total is None or not total.statistics_pending:
                 return
             if not await self._async_has_short_term_statistics():
                 _LOGGER.debug(
-                    "%s has no short-term statistics yet; the %s wait for them",
+                    "%s has no short-term statistics yet; its backfill and late "
+                    "changes wait for them",
                     self.entity_id,
-                    "backfill"
-                    if not total.backfilled
-                    else f"late changes {total.late}",
                 )
                 return
             if not total.backfilled:
                 self._import_backfill(total)
                 await self._async_recorder_commit()
                 await self._tracker.async_mark_backfilled(self._quantity)
-            if total.late:
-                applied = dict(total.late)
-                self._adjust_late(total, applied)
+            if late := dict(total.late):
+                self._adjust_late(total, late)
                 await self._async_recorder_commit()
-                await self._tracker.async_mark_backdated(self._quantity, applied)
+                await self._tracker.async_mark_backdated(self._quantity, late)
 
     async def _async_recorder_commit(self) -> None:
         """Wait until the recorder has committed the jobs queued so far."""
@@ -827,13 +816,13 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
             self.entity_id,
         )
 
-    def _adjust_late(self, total: DailyTotal, late: dict[str, float]) -> None:
+    def _adjust_late(self, total: DailyTotal, late: Mapping[date, float]) -> None:
         from homeassistant.helpers.recorder import get_instance
 
         recorder = get_instance(self.hass)
         tz = dt_util.get_default_time_zone()
-        for key, value in sorted(late.items()):
-            hour = total.late_hour(key, tz)
+        for day, value in sorted(late.items()):
+            hour = total.late_hour(day, tz)
             recorder.async_adjust_statistics(
                 self.entity_id, hour, value, self._native_unit
             )
@@ -842,7 +831,7 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
                 value,
                 self._native_unit,
                 self._quantity,
-                key,
+                day,
                 hour.isoformat(),
                 self.entity_id,
             )
@@ -857,10 +846,10 @@ class DrivingTotalSensor(SensorEntity, HyundaiKiaConnectEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return what was booked outside the state."""
         total = self._total()
-        if total is None:
+        if total is None or total.started_at is None:
             return {}
         return {
-            "measured_since": total.started,
+            "measured_since": total.started_at.date().isoformat(),
             f"booked_on_earlier_days_{self._native_unit.lower()}": round(
                 total.backdated + sum(total.late.values()), 3
             ),
