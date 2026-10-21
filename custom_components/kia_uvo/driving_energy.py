@@ -27,9 +27,9 @@ continues the sum from the sensor's last short-term row, so the sensor shifts
 the rows compiled since the meter started up by that total.
 
 Driving reported more than ~30 days late never shows up as a daily row, so
-the meters cannot count it. It is only detected: the API's total for the
-current and three previous months then grows by more than the daily rows,
-and the tracker logs a warning.
+the meters cannot count it. It is only detected: the API's rolling 90-day
+total then grows by more than the daily rows, and the tracker logs a
+warning.
 """
 
 from __future__ import annotations
@@ -175,9 +175,11 @@ class DrivingMeter:
 
     energy: DailyTotal = field(default_factory=DailyTotal)
     distance: DailyTotal = field(default_factory=DailyTotal)
-    # The API's energy total over the current and three previous months.
-    months_wh: float | None = None
-    months_carry_wh: float = 0.0
+    # The API's energy total over a rolling 90-day window. Its per-month
+    # breakdown (not exposed by the library) shows the oldest month shrinking
+    # day by day, so it is not whole calendar months.
+    window_wh: float | None = None
+    window_carry_wh: float = 0.0
     # Growth of that total not explained by the daily rows: driving reported
     # for days older than the daily window, which the meters cannot count.
     missed_wh: float = 0.0
@@ -192,37 +194,39 @@ class DrivingMeter:
         energy_rows: Mapping[date, float] | None,
         distance_rows: Mapping[date, float] | None,
         now: datetime,
-        months_wh: float | None = None,
+        window_wh: float | None = None,
     ) -> bool:
         """Apply the latest daily rows; return True if anything changed."""
         measured = self.energy.measured
         changed = self.energy.update(energy_rows, now)
-        if energy_rows and months_wh is not None:
+        if energy_rows and window_wh is not None:
             # Only with daily rows: otherwise their growth is unknown.
             changed = (
-                self._check_months(float(months_wh), self.energy.measured - measured)
+                self._check_window(float(window_wh), self.energy.measured - measured)
                 or changed
             )
         # Not short-circuited: both totals must see every poll.
         return self.distance.update(distance_rows, now) or changed
 
-    def _check_months(self, months_wh: float, counted_wh: float) -> bool:
-        """Add growth of the monthly total beyond ``counted_wh`` to ``missed_wh``.
+    def _check_window(self, window_wh: float, counted_wh: float) -> bool:
+        """Add growth of the 90-day total beyond ``counted_wh`` to ``missed_wh``.
 
         The two totals come from separate requests, so a trip reported in
         between shows as a shortfall in one poll and an excess in the next;
-        a shortfall is carried to the next poll once. A month dropping out of
-        the total is a shortfall too, and is carried once as well.
+        a shortfall is carried to the next poll once. The day dropping out of
+        the window each day is a shortfall too, and is carried once as well,
+        so a late trip smaller than that day's driving, arriving with the
+        drop or in the next poll, goes unnoticed.
         """
-        if self.months_wh is None:
-            self.months_wh = months_wh
+        if self.window_wh is None:
+            self.window_wh = window_wh
             return True
-        if months_wh == self.months_wh and not counted_wh and not self.months_carry_wh:
+        if window_wh == self.window_wh and not counted_wh and not self.window_carry_wh:
             return False
-        raw = months_wh - self.months_wh - counted_wh
-        unexplained = raw + self.months_carry_wh
-        self.months_wh = months_wh
-        self.months_carry_wh = raw if raw < 0 else 0.0
+        raw = window_wh - self.window_wh - counted_wh
+        unexplained = raw + self.window_carry_wh
+        self.window_wh = window_wh
+        self.window_carry_wh = raw if raw < 0 else 0.0
         if unexplained > 0:
             self.missed_wh += unexplained
         return True
@@ -237,8 +241,8 @@ class DrivingMeter:
         return cls(
             energy=DailyTotal.from_dict(data.get("energy", {})),
             distance=DailyTotal.from_dict(data.get("distance", {})),
-            months_wh=data.get("months_wh"),
-            months_carry_wh=float(data.get("months_carry_wh", 0.0)),
+            window_wh=data.get("window_wh"),
+            window_carry_wh=float(data.get("window_carry_wh", 0.0)),
             missed_wh=float(data.get("missed_wh", 0.0)),
         )
 
@@ -436,13 +440,13 @@ class DrivingMeterTracker:
                 new.total,
                 new.late,
             )
-        if after.months_wh != before.months_wh:
+        if after.window_wh != before.window_wh:
             _LOGGER.debug(
-                "%s: monthly driving energy total %s -> %s Wh, carried %s Wh",
+                "%s: 90-day driving energy total %s -> %s Wh, carried %s Wh",
                 self._vehicle.name,
-                before.months_wh,
-                after.months_wh,
-                after.months_carry_wh,
+                before.window_wh,
+                after.window_wh,
+                after.window_carry_wh,
             )
 
     async def async_mark_backfilled(self, quantity: Quantity) -> None:
