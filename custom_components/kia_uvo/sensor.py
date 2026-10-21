@@ -9,6 +9,15 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Final, cast
 
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import (
+    async_import_statistics,
+    get_last_short_term_statistics,
+)
 from homeassistant.components.sensor import (
     RestoreSensor,
     SensorDeviceClass,
@@ -797,13 +806,7 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
                 await self._tracker.async_mark_backdated(quantity, late)
 
     async def _async_has_short_term_statistics(self) -> bool:
-        # The recorder's statistics API is imported where it is used: parts
-        # of it are newer than the oldest supported Home Assistant version,
-        # which must still be able to load this platform.
-        from homeassistant.components.recorder.statistics import (
-            get_last_short_term_statistics,
-        )
-
+        """Return True once the recorder has compiled statistics for this sensor."""
         last = await get_instance(self.hass).async_add_executor_job(
             get_last_short_term_statistics,
             self.hass,
@@ -826,15 +829,6 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         since the meter started are shifted up by the imported total.
         Re-importing replaces rows of an earlier import at the same hours.
         """
-        from homeassistant.components.recorder.models import (
-            StatisticData,
-            StatisticMeanType,
-            StatisticMetaData,
-        )
-        from homeassistant.components.recorder.statistics import (
-            async_import_statistics,
-        )
-
         backfill = backfill_statistics(total, dt_util.get_default_time_zone())
         if backfill is None or not backfill.rows:
             return

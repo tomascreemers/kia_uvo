@@ -500,11 +500,9 @@ async def _started_sensors(
     monkeypatch: pytest.MonkeyPatch, vehicle: Vehicle, compiled: bool = True
 ) -> tuple[dict[str, Any], list[tuple[Any, list[Any]]], FakeRecorder]:
     """Set up the sensors as added to a hass with a recorder."""
-    from homeassistant.components.recorder import statistics as recorder_statistics
-
     imported: list[tuple[Any, list[Any]]] = []
     monkeypatch.setattr(
-        recorder_statistics,
+        sensor_platform,
         "async_import_statistics",
         lambda hass, metadata, stats: imported.append((metadata, list(stats))),
     )
