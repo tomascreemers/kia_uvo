@@ -146,15 +146,15 @@ class DailyTotal:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DailyTotal:
         """Build a total from ``as_dict`` output."""
-        started_at = data.get("started_at")
+        started_at = data["started_at"]
         return cls(
-            total=float(data.get("total", 0.0)),
-            rows=_date_keys(data.get("rows", {})),
+            total=data["total"],
+            rows=_date_keys(data["rows"]),
             started_at=datetime.fromisoformat(started_at) if started_at else None,
-            baseline_rows=_date_keys(data.get("baseline_rows", {})),
-            backfilled=bool(data.get("backfilled", False)),
-            late=_date_keys(data.get("late", {})),
-            backdated=float(data.get("backdated", 0.0)),
+            baseline_rows=_date_keys(data["baseline_rows"]),
+            backfilled=data["backfilled"],
+            late=_date_keys(data["late"]),
+            backdated=data["backdated"],
         )
 
 
@@ -162,8 +162,8 @@ def _iso_keys(rows: Mapping[date, float]) -> dict[str, float]:
     return {day.isoformat(): value for day, value in rows.items()}
 
 
-def _date_keys(rows: Mapping[str, Any]) -> dict[date, float]:
-    return {date.fromisoformat(day): float(value) for day, value in rows.items()}
+def _date_keys(rows: Mapping[str, float]) -> dict[date, float]:
+    return {date.fromisoformat(day): value for day, value in rows.items()}
 
 
 @dataclass
@@ -257,13 +257,14 @@ class DrivingMeter:
     def from_dict(cls, data: Mapping[str, Any]) -> DrivingMeter:
         """Build a meter from ``as_dict`` output."""
         return cls(
-            energy=DailyTotal.from_dict(data.get("energy", {})),
-            distance=DailyTotal.from_dict(data.get("distance", {})),
+            energy=DailyTotal.from_dict(data["energy"]),
+            distance=DailyTotal.from_dict(data["distance"]),
+            # Missing from meters saved before the estimate existed.
             odometer_at_start_km=data.get("odometer_at_start_km"),
             api_wh_per_km_at_start=data.get("api_wh_per_km_at_start"),
-            window_wh=data.get("window_wh"),
-            window_carry_wh=float(data.get("window_carry_wh", 0.0)),
-            missed_wh=float(data.get("missed_wh", 0.0)),
+            window_wh=data["window_wh"],
+            window_carry_wh=data["window_carry_wh"],
+            missed_wh=data["missed_wh"],
         )
 
 
