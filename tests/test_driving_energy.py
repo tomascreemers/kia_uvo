@@ -360,6 +360,14 @@ def assert_sums(parts: list[dict[date, float]], total: dict[date, float]) -> Non
     assert {key: sum(part.get(key, 0.0) for part in parts) for key in total} == total
 
 
+def by_day(changes: list[LateChange]) -> dict[date, float]:
+    """The late changes added up per day."""
+    days: dict[date, float] = {}
+    for change in changes:
+        days[change.day] = days.get(change.day, 0.0) + change.value
+    return days
+
+
 def test_consumed_parts_add_up_to_the_energy() -> None:
     # Rows of 2026-10-17 to 19 from the 30-day response, with each day
     # growing trip by trip and 18 Oct revised a day late.
@@ -378,8 +386,9 @@ def test_consumed_parts_add_up_to_the_energy() -> None:
         oct17,
         day(2026, 10, 18, 4000, 500, 300, 0, 2000),
     )
+    revised = datetime(2026, 10, 19, 21, tzinfo=TZ)
     poll(
-        datetime(2026, 10, 19, 21, tzinfo=TZ),
+        revised,
         oct17,
         day(2026, 10, 18, 6056, 819, 490, 0, 2710),
         day(2026, 10, 19, 25328, 1226, 680, 0, 3312),
@@ -388,12 +397,12 @@ def test_consumed_parts_add_up_to_the_energy() -> None:
     parts = [meter.daily_total(part) for part in CONSUMED_PARTS]
     assert sum(part.total for part in parts) == meter.energy.total
     assert sum(part.measured for part in parts) == meter.energy.measured
-    assert_sums([part.late for part in parts], meter.energy.late)
+    assert_sums([by_day(part.late) for part in parts], by_day(meter.energy.late))
     assert_sums([part.baseline_rows for part in parts], meter.energy.baseline_rows)
     assert meter.energy.total == 4800 + 27234
-    assert meter.energy.late == rows(d20261018=2565)
+    assert meter.energy.late == late(revised, d20261018=2565)
     assert meter.energy_regenerated.total == 2000 + 3312
-    assert meter.energy_regenerated.late == rows(d20261018=710)
+    assert meter.energy_regenerated.late == late(revised, d20261018=710)
 
 
 def test_part_rows_skip_days_without_the_part() -> None:
