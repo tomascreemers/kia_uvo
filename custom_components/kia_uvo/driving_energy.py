@@ -19,7 +19,9 @@ then would count all 30 days again once they come back.
 
 The rows seen when a meter starts are not counted by the meter itself:
 ``backfill_statistics`` turns them into statistics placed before the meter's
-first state, so the ~30 days before installation still show up.
+first state, so the ~30 days before installation still show up. The meter's
+reading starts at their sum, so the imported states lead up to it and the
+history graph shows those days too.
 
 Each daily row also splits its energy into the motor, climate, electronics
 and battery care parts, which add up to the row's total, and reports the
@@ -94,9 +96,10 @@ QUANTITY_UNITS: dict[Quantity, str] = {
 class DailyTotal:
     """The total of one quantity, built from the changes of its daily rows.
 
-    ``total`` counts changes to the current day's row; it is the sensor state.
-    Changes to earlier days wait in ``late`` until the sensor has added them
-    to those days' statistics, and then count in ``backdated``.
+    ``total`` counts changes to the current day's row; on top of the rows
+    seen at the start, it is the sensor state. Changes to earlier days wait in
+    ``late`` until the sensor has added them to those days' statistics, and
+    then count in ``backdated``.
     """
 
     total: float = 0.0
@@ -113,6 +116,11 @@ class DailyTotal:
     def initialized(self) -> bool:
         """Return True once a first set of daily rows has been seen."""
         return self.started_at is not None
+
+    @property
+    def reading(self) -> float:
+        """Return the sensor state: the rows seen at the start, then ``total``."""
+        return sum(self.baseline_rows.values()) + self.total
 
     @property
     def measured(self) -> float:

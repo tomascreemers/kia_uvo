@@ -114,6 +114,14 @@ def test_first_rows_only_set_the_baseline() -> None:
     assert meter.distance.total == 0
 
 
+def test_reading_starts_at_the_baseline() -> None:
+    meter = started_meter()
+    assert meter.energy.reading == 39851
+    meter.update(rows(d20261005=26762, d20261006=14089, d20261008=500), {}, NOW)
+    # The late change to 6 Oct is booked on its day, not in the reading.
+    assert meter.energy.reading == 40351
+
+
 def test_late_past_day_is_kept_apart_from_today() -> None:
     meter = started_meter()
     # Recorded 2026-10-08: the 6 Oct return trip arrived 39 h late,
@@ -599,11 +607,12 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     energy = sensors["driving_energy"]
     distance = sensors["driving_distance"]
     assert energy.state_class == SensorStateClass.TOTAL
-    assert energy.native_value == 0
+    # The day before the start, which the backfill leads up to.
+    assert energy.native_value == 13089
     assert energy.unique_id == "kia_uvo_v1_driving_energy"
     assert energy.native_unit_of_measurement == "Wh"
     assert distance.state_class == SensorStateClass.TOTAL
-    assert distance.native_value == 0
+    assert distance.native_value == 82
     assert distance.unique_id == "kia_uvo_v1_driving_distance"
     assert distance.native_unit_of_measurement == "km"
 
@@ -686,6 +695,9 @@ async def test_sensor_imports_backfill_once(monkeypatch: pytest.MonkeyPatch) -> 
     assert metadata["unit_class"] == "energy"
     assert metadata["unit_of_measurement"] == "kWh"
     assert [s["sum"] for s in stats] == [26.762, pytest.approx(39.851)]
+    # The states lead up to the sensor's first state.
+    assert [s["state"] for s in stats] == [s["sum"] for s in stats]
+    assert energy.native_value == 39851
     # The sums compiled since the start continue from the imported total.
     assert fake_recorder.adjusted == [
         (
@@ -734,7 +746,7 @@ async def test_sensor_books_late_change_on_its_day_once(
 
     vehicle.daily_stats = daily_stats(rows(d20261006=14689, d20261008=500))
     await tracker.async_process()
-    assert energy.native_value == 500
+    assert energy.native_value == 13589
     await energy._async_update_statistics()
     await energy._async_update_statistics()
 
@@ -747,7 +759,7 @@ async def test_sensor_books_late_change_on_its_day_once(
         )
     ]
     assert tracker.meter.energy.late == {}
-    assert energy.native_value == 500
+    assert energy.native_value == 13589
     assert energy.extra_state_attributes == {
         "measured_since": "2026-10-08",
         "booked_on_earlier_days_wh": 1600,
