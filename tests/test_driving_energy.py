@@ -636,7 +636,12 @@ async def test_energy_part_sensors(monkeypatch: pytest.MonkeyPatch) -> None:
         assert part.state_class == SensorStateClass.TOTAL
         assert part.device_class == "energy"
         assert part.native_unit_of_measurement == "Wh"
-        assert part.native_value == 0
+    # Like the driving energy, they start at the days before the meter, and
+    # all but the regenerated energy add up to it.
+    regenerated = parts.pop("driving_energy_regenerated")
+    assert regenerated.native_value == 1963
+    assert sum(part.native_value for part in parts.values()) == 13089
+    assert sensors["driving_energy"].native_value == 13089
 
 
 async def _started_sensors(
