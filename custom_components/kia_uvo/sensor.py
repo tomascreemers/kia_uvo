@@ -714,6 +714,9 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
     hour it is reported. A change to an earlier day goes straight into that
     day's statistics instead, so it shows up on the day it was driven. The
     state leaves it out: the recorder would otherwise book it again now.
+
+    The state starts at the total of the days before the meter, which are
+    imported as statistics leading up to it.
     """
 
     entity_description: DrivingMeterSensorEntityDescription
@@ -740,7 +743,7 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
     def native_value(self) -> float | None:
         """Return the meter reading, or None until the meter has started."""
         total = self._daily_total
-        return total.total if total.initialized else None
+        return total.reading if total.initialized else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -841,7 +844,9 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         """Import the days before the meter, then shift the compiled sums.
 
         The recorder started this sensor's sums at 0, so the sums compiled
-        since the meter started are shifted up by the imported total.
+        since the meter started are shifted up by the imported total. Each
+        imported state equals its sum: the state the meter started from is
+        that total too.
         Re-importing replaces rows of an earlier import at the same hours.
         """
         backfill = backfill_statistics(total, dt_util.get_default_time_zone())
@@ -861,10 +866,10 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
             "unit_class": converter.UNIT_CLASS,
             "unit_of_measurement": unit,
         }
-        statistics: list[StatisticData] = [
-            {"start": hour, "sum": converter.convert(value, native_unit, unit)}
-            for hour, value in backfill.rows
-        ]
+        statistics: list[StatisticData] = []
+        for hour, value in backfill.rows:
+            converted = converter.convert(value, native_unit, unit)
+            statistics.append({"start": hour, "state": converted, "sum": converted})
         async_import_statistics(self.hass, metadata, statistics)
         get_instance(self.hass).async_adjust_statistics(
             self.entity_id, backfill.meter_start, backfill.total, native_unit
