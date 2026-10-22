@@ -8,10 +8,11 @@ changes from one poll to the next, so they only move when driving is
 reported (or, rarely, corrected).
 
 The car uploads its trips on its own, sometimes days late: a forced refresh
-does not make it. A change to today's row moves the meter, so it lands in the
-hour it is reported. A change to an earlier day's row is kept apart as
-``late`` until the sensor has added it to that day's statistics, so the
-driving shows up on the day it happened.
+does not make it. Every change moves the meter when it is reported, so the
+state is always everything counted. The recorder then books it in the
+statistics of that moment; for a change to an earlier day's row, the sensor
+moves it to that day's statistics afterwards, so the driving shows up on the
+day it happened wherever the sums are used. Until then it waits in ``late``.
 
 Rows are forgotten by age, never because a response lacked them. The library
 reports no rows when the endpoint returns nothing usable, and forgetting rows
@@ -38,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, tzinfo
 from operator import attrgetter
@@ -92,14 +93,40 @@ QUANTITY_UNITS: dict[Quantity, str] = {
 }
 
 
+@dataclass(frozen=True)
+class LateChange:
+    """A change to an earlier day's row, and when it moved the meter."""
+
+    day: date
+    value: float
+    reported_at: datetime
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable representation."""
+        return {
+            "day": self.day.isoformat(),
+            "value": self.value,
+            "reported_at": self.reported_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> LateChange:
+        """Build a change from ``as_dict`` output."""
+        return cls(
+            day=date.fromisoformat(data["day"]),
+            value=data["value"],
+            reported_at=datetime.fromisoformat(data["reported_at"]),
+        )
+
+
 @dataclass
 class DailyTotal:
     """The total of one quantity, built from the changes of its daily rows.
 
-    ``total`` counts changes to the current day's row; on top of the rows
-    seen at the start, it is the sensor state. Changes to earlier days wait in
-    ``late`` until the sensor has added them to those days' statistics, and
-    then count in ``backdated``.
+    ``total`` counts changes to the current day's row. Changes to earlier
+    days wait in ``late`` until the sensor has moved them to those days'
+    statistics, and then count in ``backdated``. All of them count in the
+    sensor state, on top of the rows seen at the start.
     """
 
     total: float = 0.0
@@ -109,7 +136,7 @@ class DailyTotal:
     # The rows seen at the start, for the backfill.
     baseline_rows: dict[date, float] = field(default_factory=dict)
     backfilled: bool = False
-    late: dict[date, float] = field(default_factory=dict)
+    late: list[LateChange] = field(default_factory=list)
     backdated: float = 0.0
 
     @property
@@ -119,13 +146,13 @@ class DailyTotal:
 
     @property
     def reading(self) -> float:
-        """Return the sensor state: the rows seen at the start, then ``total``."""
-        return sum(self.baseline_rows.values()) + self.total
+        """Return the sensor state: the rows seen at the start, then ``measured``."""
+        return sum(self.baseline_rows.values()) + self.measured
 
     @property
     def measured(self) -> float:
         """Return everything counted since the start, wherever it is booked."""
-        return self.total + self.backdated + sum(self.late.values())
+        return self.total + self.backdated + sum(c.value for c in self.late)
 
     @property
     def statistics_pending(self) -> bool:
@@ -155,17 +182,14 @@ class DailyTotal:
             if day >= today:
                 self.total += delta
             elif delta:
-                self.late[day] = self.late.get(day, 0.0) + delta
+                self.late.append(LateChange(day, delta, now))
         self.rows = {day: value for day, value in self.rows.items() if day >= cutoff}
 
-    def mark_backdated(self, applied: Mapping[date, float]) -> None:
-        """Record that ``applied`` late changes were added to statistics."""
-        for day, value in applied.items():
-            remaining = self.late.pop(day, 0.0) - value
-            if abs(remaining) > 1e-9:
-                # More arrived for that day while it was being booked.
-                self.late[day] = remaining
-            self.backdated += value
+    def mark_backdated(self, applied: Sequence[LateChange]) -> None:
+        """Record that ``applied`` late changes were moved to their days."""
+        for change in applied:
+            self.late.remove(change)
+            self.backdated += change.value
 
     def late_hour(self, day: date, tz: tzinfo) -> datetime:
         """Return the statistics hour a late change to ``day`` belongs in."""
@@ -181,7 +205,7 @@ class DailyTotal:
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "baseline_rows": _iso_keys(self.baseline_rows),
             "backfilled": self.backfilled,
-            "late": _iso_keys(self.late),
+            "late": [change.as_dict() for change in self.late],
             "backdated": self.backdated,
         }
 
@@ -195,7 +219,7 @@ class DailyTotal:
             started_at=datetime.fromisoformat(started_at) if started_at else None,
             baseline_rows=_date_keys(data["baseline_rows"]),
             backfilled=data["backfilled"],
-            late=_date_keys(data["late"]),
+            late=[LateChange.from_dict(change) for change in data["late"]],
             backdated=data["backdated"],
         )
 
@@ -206,6 +230,10 @@ def _iso_keys(rows: Mapping[date, float]) -> dict[str, float]:
 
 def _date_keys(rows: Mapping[str, float]) -> dict[date, float]:
     return {date.fromisoformat(day): value for day, value in rows.items()}
+
+
+def _late_changes(late: Sequence[LateChange]) -> list[str]:
+    return [f"{c.value} for {c.day} at {c.reported_at.isoformat()}" for c in late]
 
 
 @dataclass
@@ -466,7 +494,7 @@ class DrivingMeterTracker:
                 total.started_at,
                 len(total.rows),
                 total.backfilled,
-                _iso_keys(total.late),
+                _late_changes(total.late),
                 total.backdated,
             )
         return cls(store, vehicle, now, meter)
@@ -543,7 +571,7 @@ class DrivingMeterTracker:
                     dropped,
                     old.total,
                     new.total,
-                    _iso_keys(new.late),
+                    _late_changes(new.late),
                 )
         if self.meter.window_wh != before.window_wh:
             _LOGGER.debug(
@@ -563,9 +591,9 @@ class DrivingMeterTracker:
         await self._async_change(mark)
 
     async def async_mark_backdated(
-        self, quantity: Quantity, applied: Mapping[date, float]
+        self, quantity: Quantity, applied: Sequence[LateChange]
     ) -> None:
-        """Record that ``applied`` late changes were added to statistics."""
+        """Record that ``applied`` late changes were moved to their days."""
         await self._async_change(
             lambda meter: meter.daily_total(quantity).mark_backdated(applied)
         )
