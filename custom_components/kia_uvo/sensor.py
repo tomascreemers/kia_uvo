@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Final, cast
@@ -51,6 +51,7 @@ from .driving_energy import (
     ENERGY_PARTS,
     DailyTotal,
     DrivingMeterTracker,
+    LateChange,
     Quantity,
     backfill_statistics,
 )
@@ -718,10 +719,11 @@ async def _async_driving_meter_sensors(
 class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
     """A total built from the daily driving rows, for statistics.
 
-    A change to the current day's row moves the state, so it lands in the
-    hour it is reported. A change to an earlier day goes straight into that
-    day's statistics instead, so it shows up on the day it was driven. The
-    state leaves it out: the recorder would otherwise book it again now.
+    Every change moves the state when it is reported, and the recorder books
+    it in the statistics of that moment. A change to an earlier day is then
+    moved to that day's statistics, so the sums show it on the day it was
+    driven. The states cannot be moved: the history graph shows it when it
+    was reported.
 
     The state starts at the total of the days before the meter, which are
     imported as statistics leading up to it.
@@ -763,7 +765,7 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         return {
             "measured_since": total.started_at.date().isoformat(),
             f"booked_on_earlier_days_{unit}": round(
-                total.backdated + sum(total.late.values()), 3
+                total.backdated + sum(change.value for change in total.late), 3
             ),
         }
 
@@ -814,7 +816,8 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
             total = self._daily_total
             if not total.statistics_pending:
                 return
-            if not await self._async_has_short_term_statistics():
+            compiled = await self._async_last_short_term_start()
+            if compiled is None:
                 _LOGGER.debug(
                     "%s has no short-term statistics yet; its backfill and late "
                     "changes wait for them",
@@ -826,13 +829,19 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
                 self._import_backfill(total)
                 await self._async_recorder_commit()
                 await self._tracker.async_mark_backfilled(quantity)
-            if late := dict(total.late):
+            # A late change can only be taken out of the statistics of the
+            # period it was reported in once the recorder has compiled it.
+            if late := [
+                change
+                for change in total.late
+                if _short_term_period(change.reported_at).timestamp() <= compiled
+            ]:
                 self._book_late(total, late)
                 await self._async_recorder_commit()
                 await self._tracker.async_mark_backdated(quantity, late)
 
-    async def _async_has_short_term_statistics(self) -> bool:
-        """Return True once the recorder has compiled statistics for this sensor."""
+    async def _async_last_short_term_start(self) -> float | None:
+        """Return when the last compiled short-term statistics start, if any."""
         last = await get_instance(self.hass).async_add_executor_job(
             get_last_short_term_statistics,
             self.hass,
@@ -841,7 +850,9 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
             False,
             {"sum"},
         )
-        return bool(last.get(self.entity_id))
+        if rows := last.get(self.entity_id):
+            return rows[0]["start"]
+        return None
 
     async def _async_recorder_commit(self) -> None:
         """Wait until the recorder has committed the jobs queued so far."""
@@ -890,23 +901,41 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
             self.entity_id,
         )
 
-    def _book_late(self, total: DailyTotal, late: Mapping[date, float]) -> None:
-        """Add late changes to the statistics of the days they belong to."""
+    def _book_late(self, total: DailyTotal, late: Sequence[LateChange]) -> None:
+        """Move late changes from when they were reported to their days."""
         recorder = get_instance(self.hass)
         native_unit = self.entity_description.native_unit_of_measurement
         tz = dt_util.get_default_time_zone()
-        for day, value in sorted(late.items()):
-            hour = total.late_hour(day, tz)
-            recorder.async_adjust_statistics(self.entity_id, hour, value, native_unit)
+        for change in late:
+            hour = total.late_hour(change.day, tz)
+            reported = _short_term_period(change.reported_at)
+            recorder.async_adjust_statistics(
+                self.entity_id, hour, change.value, native_unit
+            )
+            recorder.async_adjust_statistics(
+                self.entity_id, reported, -change.value, native_unit
+            )
             _LOGGER.info(
-                "Booked %s %s of driving %s reported late for %s at %s in %s",
-                value,
+                "Moved %s %s of driving %s for %s, reported late at %s, to %s in %s",
+                change.value,
                 native_unit,
                 self.entity_description.quantity,
-                day,
+                change.day,
+                reported.isoformat(),
                 hour.isoformat(),
                 self.entity_id,
             )
+
+
+def _short_term_period(moment: datetime) -> datetime:
+    """Return the start of the recorder's 5-minute period holding ``moment``.
+
+    The meter takes the time just before it saves and publishes a change, so
+    the state moves in that period unless the save straddles its end.
+    """
+    return moment.replace(
+        minute=moment.minute - moment.minute % 5, second=0, microsecond=0
+    )
 
 
 class HyundaiKiaConnectSensor(RestoreSensor, SensorEntity, HyundaiKiaConnectEntity):

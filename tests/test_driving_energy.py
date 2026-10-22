@@ -2,7 +2,7 @@
 
 import asyncio
 import copy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
@@ -19,6 +19,7 @@ from custom_components.kia_uvo.driving_energy import (
     DailyTotal,
     DrivingMeter,
     DrivingMeterTracker,
+    LateChange,
     backfill_statistics,
     daily_distance_rows,
     daily_energy_rows,
@@ -33,6 +34,11 @@ NOW = datetime(2026, 10, 8, 21, 7, tzinfo=TZ)
 def rows(**days: float) -> dict[date, float]:
     """Rows keyed like ``d20261006=13089``."""
     return {datetime.strptime(k[1:], "%Y%m%d").date(): v for k, v in days.items()}
+
+
+def late(at: datetime = NOW, **days: float) -> list[LateChange]:
+    """Late changes reported ``at``, keyed like ``rows``."""
+    return [LateChange(day, value, at) for day, value in rows(**days).items()]
 
 
 def daily_stats(energy_rows: dict[date, float]) -> list[DailyDrivingStats]:
@@ -118,8 +124,8 @@ def test_reading_starts_at_the_baseline() -> None:
     meter = started_meter()
     assert meter.energy.reading == 39851
     meter.update(rows(d20261005=26762, d20261006=14089, d20261008=500), {}, NOW)
-    # The late change to 6 Oct is booked on its day, not in the reading.
-    assert meter.energy.reading == 40351
+    # The late change to 6 Oct counts in the reading as soon as it arrives.
+    assert meter.energy.reading == 41351
 
 
 def test_late_past_day_is_kept_apart_from_today() -> None:
@@ -128,7 +134,7 @@ def test_late_past_day_is_kept_apart_from_today() -> None:
     # together with the first drive of 8 Oct.
     meter.update(rows(d20261005=26762, d20261006=25516, d20261008=13238), {}, NOW)
     assert meter.energy.total == 13238
-    assert meter.energy.late == rows(d20261006=12427)
+    assert meter.energy.late == late(d20261006=12427)
     meter.update(rows(d20261005=26762, d20261006=25516, d20261008=19465), {}, NOW)
     assert meter.energy.total == 19465
     assert meter.energy.measured == 31892
@@ -151,9 +157,9 @@ def test_trip_uploaded_two_days_late() -> None:
         saturday,
     )
     assert meter.energy.total == 221
-    assert meter.energy.late == rows(d20261008=7155)
+    assert meter.energy.late == late(saturday, d20261008=7155)
     assert meter.distance.total == 2
-    assert meter.distance.late == rows(d20261008=42)
+    assert meter.distance.late == late(saturday, d20261008=42)
     assert meter.energy.late_hour(date(2026, 10, 8), TZ) == datetime(
         2026, 10, 8, 23, tzinfo=TZ
     )
@@ -162,7 +168,7 @@ def test_trip_uploaded_two_days_late() -> None:
 def test_late_change_before_the_start_goes_to_the_backfilled_hour() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=27000, d20261006=13089), {}, NOW)
-    assert meter.energy.late == rows(d20261005=238)
+    assert meter.energy.late == late(d20261005=238)
     assert meter.energy.late_hour(date(2026, 10, 5), TZ) == datetime(
         2026, 10, 5, 12, tzinfo=TZ
     )
@@ -171,22 +177,25 @@ def test_late_change_before_the_start_goes_to_the_backfilled_hour() -> None:
 def test_new_empty_row_is_not_late() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=26762, d20261006=13089, d20261007=0), {}, NOW)
-    assert meter.energy.late == {}
+    assert meter.energy.late == []
     assert date(2026, 10, 7) in meter.energy.rows
 
 
 def test_mark_backdated_moves_late_into_backdated() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=27000, d20261006=14089), {}, NOW)
-    applied = dict(meter.energy.late)
+    applied = list(meter.energy.late)
     # More arrives for the same day before the first part is marked.
-    meter.update(rows(d20261005=27100, d20261006=14089), {}, NOW)
+    later = NOW + timedelta(minutes=30)
+    meter.update(rows(d20261005=27100, d20261006=14089), {}, later)
+    reading = meter.energy.reading
     meter.energy.mark_backdated(applied)
-    assert meter.energy.late == rows(d20261005=100)
+    assert meter.energy.late == late(later, d20261005=100)
     assert meter.energy.backdated == 1238
     assert meter.energy.measured == 1338
-    meter.energy.mark_backdated(rows(d20261005=100))
-    assert meter.energy.late == {}
+    assert meter.energy.reading == reading
+    meter.energy.mark_backdated(late(later, d20261005=100))
+    assert meter.energy.late == []
 
 
 def test_empty_response_changes_nothing() -> None:
@@ -209,8 +218,9 @@ def test_downward_correction_is_subtracted() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=26000, d20261006=13089, d20261008=500), {}, NOW)
     meter.update(rows(d20261005=26000, d20261006=13089, d20261008=400), {}, NOW)
-    assert meter.energy.late == rows(d20261005=-762)
+    assert meter.energy.late == late(d20261005=-762)
     assert meter.energy.total == 400
+    assert meter.energy.reading == 39851 - 762 + 400
 
 
 def test_rows_are_forgotten_by_age_and_old_rows_ignored() -> None:
@@ -218,7 +228,7 @@ def test_rows_are_forgotten_by_age_and_old_rows_ignored() -> None:
     later = datetime(2026, 11, 12, 9, tzinfo=TZ)
     meter.update(rows(d20261110=5000), {}, later)
     assert meter.energy.rows == rows(d20261110=5000)
-    assert meter.energy.late == rows(d20261110=5000)
+    assert meter.energy.late == late(later, d20261110=5000)
     # A row older than the retention window must never be counted.
     meter.update(rows(d20261005=26762, d20261110=5000), {}, later)
     assert meter.energy.measured == 5000
@@ -249,7 +259,8 @@ def test_round_trip() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), {}, NOW)
     meter.update_parts({"energy_climate": rows(d20261006=400)}, NOW)
-    meter.energy.mark_backdated(rows(d20261005=400))
+    meter.update(rows(d20261005=28762, d20261006=13089, d20261008=1000), {}, NOW)
+    meter.energy.mark_backdated(meter.energy.late[:1])
     assert DrivingMeter.from_dict(meter.as_dict()) == meter
 
 
@@ -265,7 +276,13 @@ def test_stored_format() -> None:
             "started_at": "2026-10-08T21:07:00+02:00",
             "baseline_rows": {"2026-10-06": 13089.0},
             "backfilled": False,
-            "late": {"2026-10-05": 1000.0},
+            "late": [
+                {
+                    "day": "2026-10-05",
+                    "value": 1000.0,
+                    "reported_at": "2026-10-08T21:07:00+02:00",
+                }
+            ],
             "backdated": 0.0,
         },
         "distance": {
@@ -274,7 +291,7 @@ def test_stored_format() -> None:
             "started_at": None,
             "baseline_rows": {},
             "backfilled": False,
-            "late": {},
+            "late": [],
             "backdated": 0.0,
         },
         **{part: DailyTotal().as_dict() for part in ENERGY_PARTS},
@@ -320,6 +337,14 @@ def assert_sums(parts: list[dict[date, float]], total: dict[date, float]) -> Non
     assert {key: sum(part.get(key, 0.0) for part in parts) for key in total} == total
 
 
+def by_day(changes: list[LateChange]) -> dict[date, float]:
+    """The late changes added up per day."""
+    days: dict[date, float] = {}
+    for change in changes:
+        days[change.day] = days.get(change.day, 0.0) + change.value
+    return days
+
+
 def test_consumed_parts_add_up_to_the_energy() -> None:
     # Rows of 2026-10-17 to 19 from the 30-day response, with each day
     # growing trip by trip and 18 Oct revised a day late.
@@ -338,8 +363,9 @@ def test_consumed_parts_add_up_to_the_energy() -> None:
         oct17,
         day(2026, 10, 18, 4000, 500, 300, 0, 2000),
     )
+    revised = datetime(2026, 10, 19, 21, tzinfo=TZ)
     poll(
-        datetime(2026, 10, 19, 21, tzinfo=TZ),
+        revised,
         oct17,
         day(2026, 10, 18, 6056, 819, 490, 0, 2710),
         day(2026, 10, 19, 25328, 1226, 680, 0, 3312),
@@ -348,12 +374,12 @@ def test_consumed_parts_add_up_to_the_energy() -> None:
     parts = [meter.daily_total(part) for part in CONSUMED_PARTS]
     assert sum(part.total for part in parts) == meter.energy.total
     assert sum(part.measured for part in parts) == meter.energy.measured
-    assert_sums([part.late for part in parts], meter.energy.late)
+    assert_sums([by_day(part.late) for part in parts], by_day(meter.energy.late))
     assert_sums([part.baseline_rows for part in parts], meter.energy.baseline_rows)
     assert meter.energy.total == 4800 + 27234
-    assert meter.energy.late == rows(d20261018=2565)
+    assert meter.energy.late == late(revised, d20261018=2565)
     assert meter.energy_regenerated.total == 2000 + 3312
-    assert meter.energy_regenerated.late == rows(d20261018=710)
+    assert meter.energy_regenerated.late == late(revised, d20261018=710)
 
 
 def test_part_rows_skip_days_without_the_part() -> None:
@@ -581,9 +607,11 @@ async def test_tracker_marks_backfilled_and_backdated() -> None:
 
     vehicle.daily_stats = daily_stats(rows(d20261006=14089))
     await tracker.async_process()
-    assert store.data["energy"]["late"] == {"2026-10-06": 1000}
-    await tracker.async_mark_backdated("energy", rows(d20261006=1000))
-    assert store.data["energy"]["late"] == {}
+    assert store.data["energy"]["late"] == [
+        {"day": "2026-10-06", "value": 1000, "reported_at": NOW.isoformat()}
+    ]
+    await tracker.async_mark_backdated("energy", late(d20261006=1000))
+    assert store.data["energy"]["late"] == []
     assert store.data["energy"]["backdated"] == 1000
 
 
@@ -645,9 +673,14 @@ async def test_energy_part_sensors(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def _started_sensors(
-    monkeypatch: pytest.MonkeyPatch, vehicle: Vehicle, compiled: bool = True
+    monkeypatch: pytest.MonkeyPatch,
+    vehicle: Vehicle,
+    compiled: datetime | None = NOW,
 ) -> tuple[dict[str, Any], list[tuple[Any, list[Any]]], FakeRecorder]:
-    """Set up the sensors as added to a hass with a recorder."""
+    """Set up the sensors as added to a hass with a recorder.
+
+    ``compiled`` is the start of the last short-term statistics.
+    """
     imported: list[tuple[Any, list[Any]]] = []
     monkeypatch.setattr(
         sensor_platform,
@@ -664,14 +697,7 @@ async def _started_sensors(
         if isinstance(sensor, sensor_platform.DrivingMeterSensor)
     }
 
-    async def has_short_term_statistics(self: Any) -> bool:
-        return compiled
-
-    monkeypatch.setattr(
-        sensor_platform.DrivingMeterSensor,
-        "_async_has_short_term_statistics",
-        has_short_term_statistics,
-    )
+    compile_up_to(monkeypatch, compiled)
     monkeypatch.setattr(
         sensor_platform.DrivingMeterSensor,
         "unit_of_measurement",
@@ -683,6 +709,19 @@ async def _started_sensors(
         sensor.entity_id = f"sensor.ev6_{key}"
         sensor.async_write_ha_state = MagicMock()
     return sensors, imported, fake_recorder
+
+
+def compile_up_to(monkeypatch: pytest.MonkeyPatch, start: datetime | None) -> None:
+    """Have the recorder's last short-term statistics start at ``start``."""
+
+    async def last_short_term_start(self: Any) -> float | None:
+        return None if start is None else start.timestamp()
+
+    monkeypatch.setattr(
+        sensor_platform.DrivingMeterSensor,
+        "_async_last_short_term_start",
+        last_short_term_start,
+    )
 
 
 async def test_sensor_imports_backfill_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -730,7 +769,7 @@ async def test_sensor_waits_for_short_term_statistics(
 ) -> None:
     vehicle = ev(rows(d20261005=26762, d20261006=13089))
     sensors, imported, fake_recorder = await _started_sensors(
-        monkeypatch, vehicle, compiled=False
+        monkeypatch, vehicle, compiled=None
     )
     energy = sensors["driving_energy"]
     await energy._async_update_statistics()
@@ -739,7 +778,7 @@ async def test_sensor_waits_for_short_term_statistics(
     assert not energy._tracker.meter.energy.backfilled
 
 
-async def test_sensor_books_late_change_on_its_day_once(
+async def test_sensor_moves_late_change_to_its_day_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vehicle = ev(rows(d20261006=13089))
@@ -751,25 +790,57 @@ async def test_sensor_books_late_change_on_its_day_once(
 
     vehicle.daily_stats = daily_stats(rows(d20261006=14689, d20261008=500))
     await tracker.async_process()
-    assert energy.native_value == 13589
+    # The state counts the late change at once; the recorder books it now.
+    assert energy.native_value == 15189
     await energy._async_update_statistics()
     await energy._async_update_statistics()
 
+    # Then it moves from the 5 minutes it was reported in to its day.
     assert fake_recorder.adjusted == [
         (
             "sensor.ev6_driving_energy",
             datetime(2026, 10, 6, 12, tzinfo=TZ),
             1600,
             "Wh",
-        )
+        ),
+        (
+            "sensor.ev6_driving_energy",
+            datetime(2026, 10, 8, 21, 5, tzinfo=TZ),
+            -1600,
+            "Wh",
+        ),
     ]
-    assert tracker.meter.energy.late == {}
-    assert energy.native_value == 13589
+    assert tracker.meter.energy.late == []
+    assert energy.native_value == 15189
     assert energy.extra_state_attributes == {
         "measured_since": "2026-10-08",
         "booked_on_earlier_days_wh": 1600,
     }
     assert tracker.meter.energy.measured == 2100
+
+
+async def test_sensor_moves_late_change_once_its_period_is_compiled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vehicle = ev(rows(d20261006=13089))
+    sensors, _, fake_recorder = await _started_sensors(
+        monkeypatch, vehicle, compiled=datetime(2026, 10, 8, 21, tzinfo=TZ)
+    )
+    energy = sensors["driving_energy"]
+    await energy._async_update_statistics()
+    fake_recorder.adjusted.clear()
+
+    # Reported at 21:07: the recorder books it in the 21:05 period.
+    vehicle.daily_stats = daily_stats(rows(d20261006=14689))
+    await energy._tracker.async_process()
+    await energy._async_update_statistics()
+    assert fake_recorder.adjusted == []
+    assert energy._tracker.meter.energy.late == late(d20261006=1600)
+
+    compile_up_to(monkeypatch, datetime(2026, 10, 8, 21, 5, tzinfo=TZ))
+    await energy._async_update_statistics()
+    assert [adjustment[2] for adjustment in fake_recorder.adjusted] == [1600, -1600]
+    assert energy._tracker.meter.energy.late == []
 
 
 async def test_sensor_marks_changes_done_only_once_committed(
@@ -795,11 +866,14 @@ async def test_sensor_marks_changes_done_only_once_committed(
     fake_recorder.commit = asyncio.get_running_loop().create_future()
     update = asyncio.create_task(energy._async_update_statistics())
     await asyncio.sleep(0)
-    assert fake_recorder.adjusted[-1][2] == 1600
-    assert tracker.meter.energy.late == rows(d20261006=1600)
+    assert [adjustment[2] for adjustment in fake_recorder.adjusted[-2:]] == [
+        1600,
+        -1600,
+    ]
+    assert tracker.meter.energy.late == late(d20261006=1600)
     fake_recorder.commit.set_result(None)
     await update
-    assert tracker.meter.energy.late == {}
+    assert tracker.meter.energy.late == []
     assert tracker.meter.energy.backdated == 1600
 
 
@@ -814,4 +888,4 @@ async def test_sensor_without_recorder_keeps_late_changes(
     await energy._tracker.async_process()
     await energy._async_update_statistics()
     assert fake_recorder.adjusted == []
-    assert energy._tracker.meter.energy.late == rows(d20261006=1600)
+    assert energy._tracker.meter.energy.late == late(d20261006=1600)
