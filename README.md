@@ -35,7 +35,7 @@ After installation, go to **Settings** → **Devices & Services** → **Integrat
 - Scan Interval - fetches cached information from servers every 30 minutes. **Configurable**
 - Force Refresh Interval - asks your car for the latest data every 4 hours. **Configurable**
 - Force Refresh is disabled between 10PM and 6AM by default. **Configurable**
-- After a failed Force Refresh, the next one waits 6 hours (or the Force Refresh Interval, if shorter), since every attempt wakes the car and drains its 12 V battery.
+- After a failed Force Refresh, the next scan only fetches the cached information, which may hold the car's late answer.
 - By default, distance unit is based on HA metric/imperial preference, you need to configure each entity if you would like other units.
 
 ## Supported entities
