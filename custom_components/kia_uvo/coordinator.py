@@ -204,16 +204,16 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
                     self.vehicle_manager.check_and_force_update_vehicles,
                     self.force_refresh_interval,
                 )
-                self._force_refresh_retry_at = None
             except Exception:
                 self._force_refresh_retry_at = dt_util.utcnow() + min(
                     FORCE_REFRESH_RETRY_DELAY,
                     timedelta(seconds=self.force_refresh_interval),
                 )
                 try:
+                    retry_at = dt_util.as_local(self._force_refresh_retry_at)
                     _LOGGER.exception(
                         f"Force update failed, not retrying before "
-                        f"{self._force_refresh_retry_at.isoformat()}, "
+                        f"{retry_at.isoformat(sep=' ', timespec='minutes')}, "
                         f"falling back to cached: {traceback.format_exc()}"
                     )
                     await self.hass.async_add_executor_job(

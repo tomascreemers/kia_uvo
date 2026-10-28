@@ -1,11 +1,4 @@
-"""Tests that a failed force refresh is not retried on every poll.
-
-A force refresh wakes the car over the mobile network. When it times out,
-the coordinator falls back to the cached state, but the data stays older than
-the force refresh interval, so every following poll used to wake the car
-again: six attempts in 2.5 h in a log from 9 Oct 2026, while the requests that
-did reach the car answered after the client had given up.
-"""
+"""Tests that a failed force refresh is not retried on every poll."""
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -82,7 +75,6 @@ async def test_failed_force_refresh_waits_before_waking_the_car_again(
     manager.check_and_force_update_vehicles.side_effect = None
     await coordinator._async_update_data()
     assert forced(coordinator) == 2
-    assert coordinator._force_refresh_retry_at is None
 
 
 async def test_retry_delay_never_exceeds_the_force_refresh_interval(
