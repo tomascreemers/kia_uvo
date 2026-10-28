@@ -7,11 +7,11 @@ from typing import Any
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
-import pytest
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.util import dt as dt_util
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.Vehicle import DailyDrivingStats
+import pytest
 
 from custom_components.kia_uvo import sensor as sensor_platform
 from custom_components.kia_uvo.const import CONF_LIFETIME_AVERAGE_CONSUMPTION
