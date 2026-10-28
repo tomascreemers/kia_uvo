@@ -32,11 +32,11 @@ by more than the daily rows, and the tracker logs a warning.
 from __future__ import annotations
 
 import asyncio
-import copy
-import logging
 from collections.abc import Callable, Mapping, Sequence
+import copy
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, tzinfo
+import logging
 from typing import Any, Literal, Protocol
 
 from hyundai_kia_connect_api import Vehicle
