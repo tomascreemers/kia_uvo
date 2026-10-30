@@ -30,6 +30,7 @@ from .const import (
     REGIONS,
 )
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
+from .driving_energy import async_setup_driving_meters
 from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,6 +67,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][config_entry.unique_id] = coordinator
+    # Before the platforms, whose entities use them.
+    coordinator.driving_meters = await async_setup_driving_meters(
+        hass, config_entry, coordinator
+    )
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
     async_setup_services(hass)
     return True
