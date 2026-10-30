@@ -9,7 +9,7 @@ from datetime import timedelta
 from functools import partial
 import logging
 import traceback
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -58,6 +58,9 @@ from .const import (
     DOMAIN,
     OffPeakChargingMode,
 )
+
+if TYPE_CHECKING:
+    from .driving_energy import DrivingMeterTracker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,6 +113,8 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
             * 60
         )
         self._force_refresh_failed = False
+        # By vehicle id, for the vehicles with driving meters.
+        self.driving_meters: dict[str, DrivingMeterTracker] = {}
         self.no_force_refresh_hour_start: int = config_entry.options.get(
             CONF_NO_FORCE_REFRESH_HOUR_START, DEFAULT_NO_FORCE_REFRESH_HOUR_START
         )

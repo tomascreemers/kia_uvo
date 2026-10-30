@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
+from functools import partial
 import logging
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -15,8 +15,12 @@ from homeassistant.components.recorder.models import (
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
+    StatisticsRow,
     async_import_statistics,
     get_last_short_term_statistics,
+    get_last_statistics,
+    get_metadata,
+    statistics_during_period,
 )
 from homeassistant.components.sensor import (
     RestoreSensor,
@@ -36,10 +40,10 @@ from homeassistant.const import (
     UnitOfPower,
     UnitOfTime,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.recorder import get_instance
-from homeassistant.helpers.storage import Store
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.typing import StateType
 from homeassistant.util import dt as dt_util
 from hyundai_kia_connect_api import Vehicle
@@ -54,6 +58,7 @@ from .const import (
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
 from .driving_energy import (
     ENERGY_PARTS,
+    ROW_RETENTION,
     DailyTotal,
     DrivingMeterTracker,
     LateChange,
@@ -63,8 +68,6 @@ from .driving_energy import (
 from .entity import HyundaiKiaConnectEntity
 
 _LOGGER = logging.getLogger(__name__)
-
-DRIVING_ENERGY_STORAGE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -625,13 +628,9 @@ async def async_setup_entry(
                     coordinator, coordinator.vehicle_manager.vehicles[vehicle_id]
                 )
             )
-        # The meters need daily_stats to hold one row per day, as in the
-        # regions that also report the 90-day total. Elsewhere it holds trips.
-        if vehicle.total_power_consumed is not None:
+        if (tracker := coordinator.driving_meters.get(vehicle_id)) is not None:
             entities.extend(
-                await _async_driving_meter_sensors(
-                    hass, config_entry, coordinator, vehicle
-                )
+                _driving_meter_sensors(coordinator, config_entry, vehicle, tracker)
             )
         entities.append(
             VehicleEntity(coordinator, coordinator.vehicle_manager.vehicles[vehicle_id])
@@ -707,30 +706,17 @@ DRIVING_METER_DESCRIPTIONS: Final[tuple[DrivingMeterSensorEntityDescription, ...
 )
 
 
-async def _async_driving_meter_sensors(
-    hass: HomeAssistant,
-    config_entry: ConfigEntry,
+def _driving_meter_sensors(
     coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+    config_entry: ConfigEntry,
     vehicle: Vehicle,
+    tracker: DrivingMeterTracker,
 ) -> list[SensorEntity]:
-    """Set up the driving meters and the lifetime estimate built on them."""
-    store: Store[dict[str, Any]] = Store(
-        hass, DRIVING_ENERGY_STORAGE_VERSION, f"{DOMAIN}.driving_energy.{vehicle.id}"
-    )
-    tracker = await DrivingMeterTracker.async_load(store, vehicle, dt_util.now)
-    await tracker.async_process()
-
-    @callback
-    def _schedule_process() -> None:
-        hass.async_create_task(
-            tracker.async_process(), f"{DOMAIN} driving meters {vehicle.id}"
-        )
-
-    config_entry.async_on_unload(coordinator.async_add_listener(_schedule_process))
+    """Return the driving meters and the lifetime estimate built on them."""
     average: float | None = config_entry.options.get(CONF_LIFETIME_AVERAGE_CONSUMPTION)
     return [
         *(
-            DrivingMeterSensor(coordinator, vehicle, tracker, description)
+            DrivingMeterSensor(coordinator, config_entry, vehicle, tracker, description)
             for description in DRIVING_METER_DESCRIPTIONS
         ),
         LifetimeDrivingEnergyEstimateSensor(
@@ -761,6 +747,7 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
     def __init__(
         self,
         coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+        config_entry: ConfigEntry,
         vehicle: Vehicle,
         tracker: DrivingMeterTracker,
         description: DrivingMeterSensorEntityDescription,
@@ -769,8 +756,8 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         super().__init__(coordinator, vehicle)
         self.entity_description = description
         self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_{description.key}"
+        self._config_entry = config_entry
         self._tracker = tracker
-        self._statistics_lock = asyncio.Lock()
 
     @property
     def _daily_total(self) -> DailyTotal:
@@ -791,16 +778,17 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         unit = self.entity_description.native_unit_of_measurement.lower()
         return {
             "measured_since": total.started_at.date().isoformat(),
-            f"booked_on_earlier_days_{unit}": round(
-                total.backdated + sum(change.value for change in total.late), 3
-            ),
+            f"booked_on_earlier_days_{unit}": round(total.measured - total.total, 3),
         }
 
     async def async_added_to_hass(self) -> None:
         """Publish whenever the tracker has saved a change."""
         await super().async_added_to_hass()
         self.async_on_remove(self._tracker.add_listener(self._handle_meter_change))
-        # Not awaited: it waits for the recorder, which can be busy at startup.
+        self.async_on_remove(async_at_started(self.hass, self._async_at_started))
+
+    @callback
+    def _async_at_started(self, hass: HomeAssistant) -> None:
         self._schedule_statistics_update()
 
     @callback
@@ -816,9 +804,17 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
 
     @callback
     def _schedule_statistics_update(self) -> None:
+        # The recorder commits nothing before Home Assistant has started, and
+        # the start waits for tasks like this one.
+        if self.hass.state is not CoreState.running:
+            return
         if self._daily_total.statistics_pending:
-            self.hass.async_create_task(
-                self._async_update_statistics(), f"{DOMAIN} {self.entity_id} statistics"
+            # Not a background task: cancelled after the recorder committed
+            # but before the mark, the change would be booked again.
+            self._config_entry.async_create_task(
+                self.hass,
+                self._async_update_statistics(),
+                f"{DOMAIN} {self.entity_id} statistics",
             )
 
     async def _async_update_statistics(self) -> None:
@@ -838,7 +834,8 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         """
         if "recorder" not in self.hass.config.components:
             return
-        async with self._statistics_lock:
+        quantity = self.entity_description.quantity
+        async with self._tracker.statistics_lock(quantity):
             # A snapshot: the tracker replaces its meter on every change.
             total = self._daily_total
             if not total.statistics_pending:
@@ -851,21 +848,23 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
                     self.entity_id,
                 )
                 return
-            quantity = self.entity_description.quantity
+            recorder = get_instance(self.hass)
             if not total.backfilled:
-                self._import_backfill(total)
-                await self._async_recorder_commit()
+                await self._async_import_backfill(total)
+                await recorder.async_block_till_done()
                 await self._tracker.async_mark_backfilled(quantity)
-            # A late change can only be taken out of the statistics of the
-            # period it was reported in once the recorder has compiled it.
-            if late := [
-                change
-                for change in total.late
-                if _short_term_period(change.reported_at).timestamp() <= compiled
-            ]:
-                self._book_late(total, late)
-                await self._async_recorder_commit()
-                await self._tracker.async_mark_backdated(quantity, late)
+            for change in total.late:
+                # A late change can only be taken out of the statistics of the
+                # period it was reported in once the recorder has compiled it.
+                if _short_term_period(change.reported_at).timestamp() > compiled:
+                    continue
+                if (hour := await self._async_booking_hour(total, change)) is None:
+                    continue
+                self._move_late(change, hour)
+                # One at a time: the next one's hour is looked up in the
+                # statistics this one changes.
+                await recorder.async_block_till_done()
+                await self._tracker.async_mark_backdated(quantity, [change])
 
     async def _async_last_short_term_start(self) -> float | None:
         """Return when the last compiled short-term statistics start, if any."""
@@ -881,12 +880,57 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
             return rows[0]["start"]
         return None
 
-    async def _async_recorder_commit(self) -> None:
-        """Wait until the recorder has committed the jobs queued so far."""
-        if future := get_instance(self.hass).async_get_commit_future():
-            await future
+    async def _async_last_hour_start(self) -> float | None:
+        """Return when the last compiled hourly statistics start, if any."""
+        last = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, self.entity_id, False, {"sum"}
+        )
+        if rows := last.get(self.entity_id):
+            return rows[0]["start"]
+        return None
 
-    def _import_backfill(self, total: DailyTotal) -> None:
+    async def _async_statistics_rows(
+        self, start: datetime, end: datetime, period: Literal["hour", "day"]
+    ) -> list[StatisticsRow]:
+        """Return the statistics from ``start`` up to ``end``, oldest first."""
+        rows = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            start,
+            end,
+            {self.entity_id},
+            period,
+            None,
+            {"state", "sum"},
+        )
+        return rows.get(self.entity_id, [])
+
+    async def _async_statistics_metadata(self) -> StatisticMetaData:
+        """Return metadata to import with, in the unit the statistics are kept in.
+
+        The recorder keeps the unit of the first compiled state; importing
+        with another one would relabel the rows already there.
+        """
+        converter = UNIT_CONVERTERS[self.device_class]
+        stored = await get_instance(self.hass).async_add_executor_job(
+            partial(get_metadata, self.hass, statistic_ids={self.entity_id})
+        )
+        unit = (
+            stored[self.entity_id][1]["unit_of_measurement"]
+            if self.entity_id in stored
+            else self.unit_of_measurement
+        )
+        return {
+            "mean_type": StatisticMeanType.NONE,
+            "has_sum": True,
+            "name": None,
+            "source": "recorder",
+            "statistic_id": self.entity_id,
+            "unit_class": converter.UNIT_CLASS,
+            "unit_of_measurement": unit,
+        }
+
+    async def _async_import_backfill(self, total: DailyTotal) -> None:
         """Import the days before the meter, then shift the compiled sums.
 
         The recorder started this sensor's sums at 0, so the sums compiled
@@ -899,19 +943,9 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         if backfill is None or not backfill.rows:
             return
         native_unit = self.entity_description.native_unit_of_measurement
-        # Statistics are kept in the unit of the state, which need not be the
-        # native one.
-        unit = self.unit_of_measurement
+        metadata = await self._async_statistics_metadata()
+        unit = metadata["unit_of_measurement"]
         converter = UNIT_CONVERTERS[self.device_class]
-        metadata: StatisticMetaData = {
-            "mean_type": StatisticMeanType.NONE,
-            "has_sum": True,
-            "name": None,
-            "source": "recorder",
-            "statistic_id": self.entity_id,
-            "unit_class": converter.UNIT_CLASS,
-            "unit_of_measurement": unit,
-        }
         statistics: list[StatisticData] = []
         for hour, value in backfill.rows:
             converted = converter.convert(value, native_unit, unit)
@@ -922,36 +956,64 @@ class DrivingMeterSensor(SensorEntity, HyundaiKiaConnectEntity):
         )
         _LOGGER.info(
             "Imported %d days of driving %s before %s into %s",
-            len(backfill.rows),
+            len(total.baseline_rows),
             self.entity_description.quantity,
             total.started_at,
             self.entity_id,
         )
 
-    def _book_late(self, total: DailyTotal, late: Sequence[LateChange]) -> None:
-        """Move late changes from when they were reported to their days."""
+    async def _async_booking_hour(
+        self, total: DailyTotal, change: LateChange
+    ) -> datetime | None:
+        """Return the hour to move ``change`` to, or None to wait.
+
+        That is its day's hour for late changes if the recorder compiled it,
+        else the latest hour of that day it did compile (the sensor was
+        unavailable after it), so it never lands on another day. A day with
+        no hour at all gets a row at that hour, carrying the sum before it.
+        Until the recorder has compiled past that hour, it waits.
+        """
+        tz = dt_util.get_default_time_zone()
+        hour = total.late_hour(change.day, tz)
+        last = await self._async_last_hour_start()
+        if last is None or last < hour.timestamp():
+            return None
+        day_start = dt_util.as_utc(datetime.combine(change.day, time(), tz))
+        end = hour + timedelta(hours=1)
+        if rows := await self._async_statistics_rows(day_start, end, "hour"):
+            return dt_util.utc_from_timestamp(rows[-1]["start"])
+        # By day: each day's row holds its last hour's sum and state.
+        before = await self._async_statistics_rows(hour - ROW_RETENTION, hour, "day")
+        if before and (previous := before[-1])["sum"] is not None:
+            row: StatisticData = {"start": hour, "sum": previous["sum"]}
+            if previous["state"] is not None:
+                row["state"] = previous["state"]
+            async_import_statistics(
+                self.hass, await self._async_statistics_metadata(), [row]
+            )
+        return hour
+
+    def _move_late(self, change: LateChange, hour: datetime) -> None:
+        """Move a late change from when it was reported to ``hour``."""
         recorder = get_instance(self.hass)
         native_unit = self.entity_description.native_unit_of_measurement
-        tz = dt_util.get_default_time_zone()
-        for change in late:
-            hour = total.late_hour(change.day, tz)
-            reported = _short_term_period(change.reported_at)
-            recorder.async_adjust_statistics(
-                self.entity_id, hour, change.value, native_unit
-            )
-            recorder.async_adjust_statistics(
-                self.entity_id, reported, -change.value, native_unit
-            )
-            _LOGGER.info(
-                "Moved %s %s of driving %s for %s, reported late at %s, to %s in %s",
-                change.value,
-                native_unit,
-                self.entity_description.quantity,
-                change.day,
-                reported.isoformat(),
-                hour.isoformat(),
-                self.entity_id,
-            )
+        reported = _short_term_period(change.reported_at)
+        recorder.async_adjust_statistics(
+            self.entity_id, hour, change.value, native_unit
+        )
+        recorder.async_adjust_statistics(
+            self.entity_id, reported, -change.value, native_unit
+        )
+        _LOGGER.info(
+            "Moved %s %s of driving %s for %s, reported late at %s, to %s in %s",
+            change.value,
+            native_unit,
+            self.entity_description.quantity,
+            change.day,
+            reported.isoformat(),
+            hour.isoformat(),
+            self.entity_id,
+        )
 
 
 def _short_term_period(moment: datetime) -> datetime:
@@ -960,6 +1022,7 @@ def _short_term_period(moment: datetime) -> datetime:
     The meter takes the time just before it saves and publishes a change, so
     the state moves in that period unless the save straddles its end.
     """
+    moment = dt_util.as_utc(moment)
     return moment.replace(
         minute=moment.minute - moment.minute % 5, second=0, microsecond=0
     )
