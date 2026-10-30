@@ -563,6 +563,12 @@
       "data": {
         "name": "Gegevens"
       },
+      "driving_distance": {
+        "name": "Driving Distance"
+      },
+      "driving_energy": {
+        "name": "Driving Energy"
+      },
       "daily_driving_stats": {
         "name": "Dagelijkse ritstatistieken"
       },
