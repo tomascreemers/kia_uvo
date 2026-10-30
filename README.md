@@ -56,6 +56,7 @@ After installation, go to **Settings** → **Devices & Services** → **Integrat
 - Location Last Updated
 - Daily Driving Stats, Today's Daily Driving Stats
 - Driving Energy, Driving Distance: meters for long-term statistics and the Energy dashboard, built from the daily driving stats, including the ~30 days before setup
+- Lifetime Driving Energy (Estimate): the odometer at setup times an average consumption, plus Driving Energy since then. Set each car's Lifetime Average Consumption (kWh/100 km, under its configuration entities) to the lifetime average the car shows; until then it is the API's 30-day average at setup
 - SVM Status (time of the last surround-view capture)
 
 ### EV Diagnostics (CCS2 vehicles)

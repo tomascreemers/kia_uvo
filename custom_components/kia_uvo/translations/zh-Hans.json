@@ -428,6 +428,9 @@
       "last_scanned_at": {
         "name": "上次扫描"
       },
+      "lifetime_driving_energy_estimate": {
+        "name": "Lifetime Driving Energy (Estimate)"
+      },
       "ev_battery_percentage": {
         "name": "动力电池电量"
       },
@@ -941,6 +944,9 @@
       },
       "ev_v2l_discharge_limit": {
         "name": "V2L 放电上限"
+      },
+      "lifetime_average_consumption": {
+        "name": "Lifetime Average Consumption"
       }
     },
     "device_tracker": {

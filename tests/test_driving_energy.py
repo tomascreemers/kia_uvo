@@ -14,8 +14,11 @@ from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.Vehicle import DailyDrivingStats
 import pytest
 
-from custom_components.kia_uvo import driving_energy, sensor as sensor_platform
-from custom_components.kia_uvo.const import CONF_LIFETIME_AVERAGE_CONSUMPTION
+from custom_components.kia_uvo import (
+    driving_energy,
+    number as number_platform,
+    sensor as sensor_platform,
+)
 from custom_components.kia_uvo.driving_energy import (
     ROW_RETENTION,
     DailyTotal,
@@ -307,17 +310,20 @@ def test_lifetime_estimate() -> None:
     meter = started_meter()
     meter.update(rows(d20261005=27762, d20261006=13089, d20261008=1000), {}, NOW)
     measured = 1000 + 1000
-    assert meter.lifetime_estimate_wh(185.0) == pytest.approx(50828.1 * 185 + measured)
-    assert meter.lifetime_estimate_wh(None) == pytest.approx(50828.1 * 158 + measured)
-    assert DrivingMeter().lifetime_estimate_wh(185.0) is None
+    assert meter.lifetime_estimate_wh() == pytest.approx(50828.1 * 158 + measured)
+    meter.average_wh_per_km = 185.0
+    assert meter.lifetime_estimate_wh() == pytest.approx(50828.1 * 185 + measured)
+    assert DrivingMeter(average_wh_per_km=185.0).lifetime_estimate_wh() is None
 
 
 def test_meter_saved_before_the_estimate_loads() -> None:
     data = started_meter().as_dict()
     del data["odometer_at_start_km"], data["api_wh_per_km_at_start"]
+    del data["average_wh_per_km"]
     meter = DrivingMeter.from_dict(data)
+    meter.average_wh_per_km = 185.0
     # The odometer at its start is unknown, so it gets no estimate.
-    assert meter.lifetime_estimate_wh(185.0) is None
+    assert meter.lifetime_estimate_wh() is None
 
 
 def test_round_trip() -> None:
@@ -360,6 +366,7 @@ def test_stored_format() -> None:
         },
         "odometer_at_start_km": None,
         "api_wh_per_km_at_start": None,
+        "average_wh_per_km": None,
         "window_wh": 963025.0,
         "window_carry_wh": 0.0,
         "missed_wh": 0.0,
@@ -618,7 +625,6 @@ async def _set_up(
     monkeypatch: pytest.MonkeyPatch,
     vehicle: Vehicle,
     store: FakeStore | None = None,
-    options: dict[str, Any] | None = None,
 ) -> tuple[Any, Any, Any, list[Any]]:
     """Set the entry up as ``__init__`` does, then its sensor platform.
 
@@ -628,7 +634,6 @@ async def _set_up(
     monkeypatch.setattr(dt_util, "now", lambda: NOW)
     coordinator = make_coordinator(vehicle)
     hass, config_entry = make_hass(coordinator)
-    config_entry.options = options or {}
     coordinator.driving_meters = await driving_energy.async_setup_driving_meters(
         hass, config_entry, coordinator
     )
@@ -640,10 +645,9 @@ async def _set_up(
 async def _set_up_sensors(
     monkeypatch: pytest.MonkeyPatch,
     vehicle: Vehicle,
-    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the sensors set up for ``vehicle``, by unique id less its prefix."""
-    *_, created = await _set_up(monkeypatch, vehicle, options=options)
+    *_, created = await _set_up(monkeypatch, vehicle)
     return {entity.unique_id.removeprefix("kia_uvo_v1_"): entity for entity in created}
 
 
@@ -719,14 +723,27 @@ async def test_unreadable_meter_store_leaves_the_other_sensors(
 
 
 async def test_lifetime_estimate_sensor(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(dt_util, "now", lambda: NOW)
-    sensors = await _set_up_sensors(
-        monkeypatch,
-        ev(rows(d20261006=13089)),
-        {CONF_LIFETIME_AVERAGE_CONSUMPTION: 18.5},
+    vehicle = ev(rows(d20261006=13089))
+    vehicle.power_consumption_30d = 158
+    hass, config_entry, coordinator, created = await _set_up(monkeypatch, vehicle)
+    estimate = next(
+        e for e in created if e.unique_id.endswith("lifetime_driving_energy_estimate")
     )
-    estimate = sensors["lifetime_driving_energy_estimate"]
     assert estimate.state_class is None
+    assert estimate.native_value == pytest.approx(50828.1 * 158)
+    assert estimate.extra_state_attributes["average_source"] == "api_30_day_average"
+
+    numbers: list[Any] = []
+    await number_platform.async_setup_entry(hass, config_entry, numbers.extend)
+    (average,) = (n for n in numbers if n.unique_id.endswith("average_consumption"))
+    assert average.unique_id == "kia_uvo_v1_lifetime_average_consumption"
+    assert average.available
+    assert average.native_value == 15.8
+    await average.async_set_native_value(18.5)
+
+    tracker = coordinator.driving_meters["v1"]
+    assert tracker.meter.average_wh_per_km == 185
+    assert average.native_value == 18.5
     assert estimate.native_value == pytest.approx(50828.1 * 185)
     assert estimate.extra_state_attributes == {
         "measured_since": "2026-10-08",
@@ -734,6 +751,30 @@ async def test_lifetime_estimate_sensor(monkeypatch: pytest.MonkeyPatch) -> None
         "average_consumption_kwh_per_100km": 18.5,
         "average_source": "configured",
     }
+
+
+async def test_each_car_keeps_its_own_average(monkeypatch: pytest.MonkeyPatch) -> None:
+    first, second = ev(rows(d20261006=13089)), ev(rows(d20261006=9000))
+    second.id = "v2"
+    monkeypatch.setattr(driving_energy, "Store", lambda *args: FakeStore())
+    monkeypatch.setattr(dt_util, "now", lambda: NOW)
+    coordinator = make_coordinator(first, second)
+    hass, config_entry = make_hass(coordinator)
+    coordinator.driving_meters = await driving_energy.async_setup_driving_meters(
+        hass, config_entry, coordinator
+    )
+    await coordinator.driving_meters["v1"].async_set_average(185)
+    assert coordinator.driving_meters["v2"].meter.average_wh_per_km is None
+
+
+async def test_lifetime_estimate_sensor_without_an_average(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dt_util, "now", lambda: NOW)
+    sensors = await _set_up_sensors(monkeypatch, ev(rows(d20261006=13089)))
+    estimate = sensors["lifetime_driving_energy_estimate"]
+    assert estimate.native_value is None
+    assert estimate.extra_state_attributes["average_source"] is None
 
 
 async def _started_sensors(
@@ -879,9 +920,8 @@ async def test_sensor_moves_late_change_to_its_day_once(
         "booked_on_earlier_days_wh": 1600,
     }
     assert tracker.meter.energy.measured == 2100
-    assert tracker.meter.lifetime_estimate_wh(158.0) == pytest.approx(
-        50828.1 * 158 + 2100
-    )
+    await tracker.async_set_average(158.0)
+    assert tracker.meter.lifetime_estimate_wh() == pytest.approx(50828.1 * 158 + 2100)
 
 
 async def test_sensor_moves_late_change_once_its_period_is_compiled(
