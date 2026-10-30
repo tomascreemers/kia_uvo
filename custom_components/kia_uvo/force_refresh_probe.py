@@ -18,6 +18,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 from hyundai_kia_connect_api import VehicleManager
+from hyundai_kia_connect_api.KiaUvoApiEU import KiaUvoApiEU
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,11 +29,12 @@ ENTITY_ID = "sensor.kia_uvo_force_refresh_probe"
 def install(hass: HomeAssistant, manager: VehicleManager) -> None:
     """Wrap the API session's GET for the forced status request."""
     api = manager.api
-    session = getattr(api, "session", None)
-    base_url = getattr(api, "SPA_API_URL", None)
-    if session is None or not isinstance(base_url, str):
+    # AU, IN and CN share the URL, but the experiment is about the EU server.
+    if not isinstance(api, KiaUvoApiEU):
         return
-    forced_status = re.compile(re.escape(base_url) + r"vehicles/[^/]+/status")
+    # Any: mypy does not allow replacing the method.
+    session: Any = api.session
+    forced_status = re.compile(re.escape(api.SPA_API_URL) + r"vehicles/[^/]+/status")
     get: Callable[..., Any] = session.get
 
     def probed_get(url: str, *args: Any, **kwargs: Any) -> Any:
