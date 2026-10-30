@@ -47,7 +47,7 @@ After installation, go to **Settings** → **Devices & Services** → **Integrat
 - EV Target Range (AC/DC charge)
 - Air Temperature, Outside Temperature
 - Fuel Level
-- Total Power Consumed/Regenerated, Power Consumption 30d
+- Total Power Consumed/Regenerated, Power Consumption 30d. The totals cover a rolling 90 days, so they keep no long-term statistics; Home Assistant raises a repair for statistics recorded by older versions, which you can delete. Use Driving Energy in the Energy dashboard instead.
 - Front/Rear Seat Status and Heater
 - Last Service Distance, Next Service Distance
 - Engine Type, DTC Count
