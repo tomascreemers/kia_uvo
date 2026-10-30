@@ -56,6 +56,7 @@ After installation, go to **Settings** → **Devices & Services** → **Integrat
 - Location Last Updated
 - Daily Driving Stats, Today's Daily Driving Stats
 - Driving Energy, Driving Distance: meters for long-term statistics and the Energy dashboard, built from the daily driving stats, including the ~30 days before setup
+- Driving Energy Motor, Climate, Electronics and Battery Care, which add up to Driving Energy, and Driving Energy Regenerated (the motor part is already net of it)
 - SVM Status (time of the last surround-view capture)
 
 ### EV Diagnostics (CCS2 vehicles)
