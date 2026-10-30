@@ -35,15 +35,31 @@ import asyncio
 from collections.abc import Callable, Mapping, Sequence
 import copy
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 import logging
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
+from homeassistant.util.hass_dict import HassKey
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.const import LENGTH_MILES
 from hyundai_kia_connect_api.Vehicle import DailyDrivingStats
 
+from .const import DOMAIN
+
+if TYPE_CHECKING:
+    from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
+
 _LOGGER = logging.getLogger(__name__)
+
+STORAGE_VERSION = 1
+# The trackers of all vehicles, by vehicle id; they outlive entry reloads.
+DRIVING_METERS: HassKey[dict[str, DrivingMeterTracker]] = HassKey(
+    f"{DOMAIN}_driving_meters"
+)
 
 # Longer than the ~30 days the API returns, so a row is never forgotten
 # while the API can still revise it.
@@ -160,8 +176,8 @@ class DailyTotal:
     def late_hour(self, day: date, tz: tzinfo) -> datetime:
         """Return the statistics hour a late change to ``day`` belongs in."""
         if self.started_at is not None and day < self.started_at.date():
-            return datetime.combine(day, BACKFILL_HOUR, tz)
-        return datetime.combine(day, LATE_HOUR, tz)
+            return _statistics_hour(day, BACKFILL_HOUR, tz)
+        return _statistics_hour(day, LATE_HOUR, tz)
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable representation."""
@@ -188,6 +204,19 @@ class DailyTotal:
             late=[LateChange.from_dict(change) for change in data["late"]],
             backdated=data["backdated"],
         )
+
+
+def _statistics_hour(day: date, at: time, tz: tzinfo) -> datetime:
+    """Return the recorder's hour holding ``at`` on ``day``.
+
+    The recorder's hours are UTC hours, which local hours are not in time
+    zones half an hour off UTC.
+    """
+    return _utc_hour(datetime.combine(day, at, tz))
+
+
+def _utc_hour(moment: datetime) -> datetime:
+    return moment.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
 
 
 def _iso_keys(rows: Mapping[date, float]) -> dict[str, float]:
@@ -293,24 +322,30 @@ def backfill_statistics(total: DailyTotal, tz: tzinfo) -> Backfill | None:
     hours the recorder already compiled would break the sum chain. Home
     Assistant counts the first row's sum as that hour's change, so the sums
     start from the first day's value, as if they had been 0 before.
+
+    Every day a late change can still be booked on gets a row, driven or
+    not: adjusting the sums only moves rows that exist, so a change to a day
+    without one would show on the next day that has one.
     """
     if total.started_at is None:
         return None
-    meter_start = total.started_at.astimezone(tz).replace(
-        minute=0, second=0, microsecond=0
-    )
+    meter_start = _utc_hour(total.started_at)
     last_hour = meter_start - timedelta(hours=1)
+    start_day = total.started_at.date()
+    day = min([start_day - ROW_RETENTION, *total.baseline_rows])
+    last_day = max([start_day, *total.baseline_rows])
     rows: list[tuple[datetime, float]] = []
     running = 0.0
-    for day, value in sorted(total.baseline_rows.items()):
+    while day <= last_day:
         # The start day's hour can fall after the meter's first state.
-        hour = min(datetime.combine(day, BACKFILL_HOUR, tz), last_hour)
-        running += value
+        hour = min(_statistics_hour(day, BACKFILL_HOUR, tz), last_hour)
+        running += total.baseline_rows.get(day, 0.0)
         if rows and hour <= rows[-1][0]:
             # Two days in the same hour: one row for both.
             rows[-1] = (rows[-1][0], running)
         else:
             rows.append((hour, running))
+        day += timedelta(days=1)
     return Backfill(rows, running, meter_start)
 
 
@@ -367,11 +402,23 @@ class DrivingMeterTracker:
     ) -> None:
         """Initialize the tracker."""
         self._store = store
-        self._vehicle = vehicle
+        # Replaced when the config entry reloads, which builds new vehicles.
+        self.vehicle = vehicle
         self._now = now
         self._lock = asyncio.Lock()
+        self._statistics_locks = {
+            quantity: asyncio.Lock() for quantity in QUANTITY_UNITS
+        }
         self._listeners: list[Callable[[], None]] = []
         self.meter = meter
+
+    def statistics_lock(self, quantity: Quantity) -> asyncio.Lock:
+        """Return the lock held while ``quantity``'s statistics are changed.
+
+        It belongs to the tracker, not to a sensor, so a sensor set up again
+        waits for its predecessor's changes and then sees them marked done.
+        """
+        return self._statistics_locks[quantity]
 
     @classmethod
     async def async_load(
@@ -402,17 +449,20 @@ class DrivingMeterTracker:
 
     async def async_process(self) -> None:
         """Apply the vehicle's latest daily rows, then notify the listeners."""
-        energy_rows = daily_energy_rows(self._vehicle)
-        distance_rows = daily_distance_rows(self._vehicle)
-        window_wh = self._vehicle.total_power_consumed
-        now = self._now()
-        before = await self._async_change(
-            lambda meter: meter.update(energy_rows, distance_rows, now, window_wh)
-        )
+        energy_rows = daily_energy_rows(self.vehicle)
+        distance_rows = daily_distance_rows(self.vehicle)
+        window_wh = self.vehicle.total_power_consumed
+
+        def update(meter: DrivingMeter) -> None:
+            # Under the lock, right before the change is saved and published.
+            now = self._now()
+            meter.update(energy_rows, distance_rows, now, window_wh)
+
+        before = await self._async_change(update)
         if before is None:
             _LOGGER.debug(
                 "%s: driving meters unchanged (%d daily rows)",
-                self._vehicle.name,
+                self.vehicle.name,
                 len(energy_rows),
             )
             return
@@ -422,10 +472,13 @@ class DrivingMeterTracker:
                 "%s: %.0f Wh of driving was reported for days older than the "
                 "~30 days of daily rows. It is not in Driving Energy or Driving "
                 "Distance (%.0f Wh missed so far)",
-                self._vehicle.name,
+                self.vehicle.name,
                 missed,
                 self.meter.missed_wh,
             )
+        self._notify()
+
+    def _notify(self) -> None:
         for listener in list(self._listeners):
             listener()
 
@@ -439,7 +492,7 @@ class DrivingMeterTracker:
                     _LOGGER.debug(
                         "%s: driving %s meter started at %s, %d days before it "
                         "(%s %s) left for the backfill",
-                        self._vehicle.name,
+                        self.vehicle.name,
                         quantity,
                         new.started_at,
                         len(new.baseline_rows),
@@ -457,7 +510,7 @@ class DrivingMeterTracker:
                 _LOGGER.debug(
                     "%s: driving %s rows changed by %s %s, dropped %s; "
                     "total %s -> %s, late %s",
-                    self._vehicle.name,
+                    self.vehicle.name,
                     quantity,
                     changes,
                     unit,
@@ -469,7 +522,7 @@ class DrivingMeterTracker:
         if self.meter.window_wh != before.window_wh:
             _LOGGER.debug(
                 "%s: 90-day driving energy total %s -> %s Wh, carried %s Wh",
-                self._vehicle.name,
+                self.vehicle.name,
                 before.window_wh,
                 self.meter.window_wh,
                 self.meter.window_carry_wh,
@@ -520,3 +573,68 @@ class DrivingMeterTracker:
             self._listeners.remove(listener)
 
         return remove
+
+
+async def async_setup_driving_meters(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+) -> dict[str, DrivingMeterTracker]:
+    """Return the trackers of the entry's vehicles that have meters.
+
+    A tracker outlives reloads of the entry, so statistics work that a sensor
+    started before one (waiting for a slow recorder) ends on the same meter,
+    under the same lock, as its successor's.
+    """
+    trackers = hass.data.setdefault(DRIVING_METERS, {})
+    found: dict[str, DrivingMeterTracker] = {}
+    for vehicle in coordinator.vehicle_manager.vehicles.values():
+        # The meters need daily_stats to hold one row per day, as in the
+        # regions that also report the 90-day total. Elsewhere it holds trips.
+        if vehicle.total_power_consumed is None:
+            continue
+        try:
+            if (tracker := trackers.get(vehicle.id)) is None:
+                store: Store[dict[str, Any]] = Store(
+                    hass, STORAGE_VERSION, f"{DOMAIN}.driving_energy.{vehicle.id}"
+                )
+                tracker = await DrivingMeterTracker.async_load(
+                    store, vehicle, dt_util.now
+                )
+                trackers[vehicle.id] = tracker
+            tracker.vehicle = vehicle
+            await tracker.async_process()
+        except Exception:
+            # A meter that cannot be loaded must not take the other entities
+            # down. Its store is left as it is.
+            _LOGGER.exception("%s: could not set up the driving meters", vehicle.name)
+            continue
+        found[vehicle.id] = tracker
+        config_entry.async_on_unload(
+            coordinator.async_add_listener(
+                _process_on_update(hass, config_entry, coordinator, tracker)
+            )
+        )
+    return found
+
+
+def _process_on_update(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+    tracker: DrivingMeterTracker,
+) -> Callable[[], None]:
+    @callback
+    def process() -> None:
+        # After a failed update the sensors are unavailable: a change published
+        # now would reach the statistics only later, away from where it is
+        # moved out of them. The next successful update brings it.
+        if not coordinator.last_update_success:
+            return
+        config_entry.async_create_task(
+            hass,
+            tracker.async_process(),
+            f"{DOMAIN} driving meters {tracker.vehicle.id}",
+        )
+
+    return process
