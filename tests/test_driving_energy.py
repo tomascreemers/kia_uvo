@@ -2,20 +2,22 @@
 
 import asyncio
 import copy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import SensorStateClass
+from homeassistant.core import CoreState
 from homeassistant.util import dt as dt_util
 from hyundai_kia_connect_api import Vehicle
 from hyundai_kia_connect_api.Vehicle import DailyDrivingStats
 import pytest
 
-from custom_components.kia_uvo import sensor as sensor_platform
+from custom_components.kia_uvo import driving_energy, sensor as sensor_platform
 from custom_components.kia_uvo.const import CONF_LIFETIME_AVERAGE_CONSUMPTION
 from custom_components.kia_uvo.driving_energy import (
+    ROW_RETENTION,
     DailyTotal,
     DrivingMeter,
     DrivingMeterTracker,
@@ -83,14 +85,64 @@ class FakeRecorder:
     def __init__(self) -> None:
         self.adjusted: list[tuple[str, datetime, float, str]] = []
         self.commit: asyncio.Future[None] | None = None
+        self.statistics = FakeStatistics()
 
-    def async_get_commit_future(self) -> asyncio.Future[None] | None:
-        return self.commit
+    async def async_add_executor_job(self, target: Any, *args: Any) -> Any:
+        return target(*args)
+
+    async def async_block_till_done(self) -> None:
+        if self.commit is not None:
+            await self.commit
 
     def async_adjust_statistics(
         self, statistic_id: str, start: datetime, adjustment: float, unit: str
     ) -> None:
         self.adjusted.append((statistic_id, start, adjustment, unit))
+
+
+class FakeStatistics:
+    """A sensor's hourly statistics: every hour up to ``compiled``, but ``missing``.
+
+    Stands in for the recorder's statistics queries; ``units`` are the units
+    the recorder keeps, by statistic id.
+    """
+
+    def __init__(self) -> None:
+        self.compiled = datetime(2027, 1, 1, tzinfo=dt_util.UTC)
+        self.missing: set[datetime] = set()
+        self.units: dict[str, str] = {}
+
+    def last(self, hass: Any, number: int, statistic_id: str, *args: Any) -> Any:
+        return {statistic_id: [{"start": self.compiled.timestamp(), "sum": 0.0}]}
+
+    def during(
+        self,
+        hass: Any,
+        start: datetime,
+        end: datetime,
+        ids: set[str],
+        period: str,
+        *args: Any,
+    ) -> Any:
+        (statistic_id,) = ids
+        if period == "day":
+            return {
+                statistic_id: [{"start": start.timestamp(), "sum": 7.0, "state": 7.0}]
+            }
+        hours = []
+        hour = start
+        while hour < end and hour <= self.compiled:
+            if hour not in self.missing:
+                hours.append({"start": hour.timestamp(), "sum": 0.0, "state": 0.0})
+            hour += timedelta(hours=1)
+        return {statistic_id: hours}
+
+    def metadata(self, hass: Any, *, statistic_ids: set[str]) -> Any:
+        return {
+            statistic_id: (1, {"unit_of_measurement": self.units[statistic_id]})
+            for statistic_id in statistic_ids
+            if statistic_id in self.units
+        }
 
 
 def started_meter() -> DrivingMeter:
@@ -389,13 +441,30 @@ def test_backfill_starts_at_zero_before_first_state() -> None:
     meter.update(rows(d20261005=26762, d20261006=25516, d20261008=19465), {}, NOW)
     backfill = backfill_statistics(meter.energy, TZ)
     assert backfill is not None
-    assert backfill.rows == [
+    assert backfill.rows[-4:] == [
         (datetime(2026, 10, 5, 12, tzinfo=TZ), 26762),
         (datetime(2026, 10, 6, 12, tzinfo=TZ), 52278),
+        (datetime(2026, 10, 7, 12, tzinfo=TZ), 52278),
         (datetime(2026, 10, 8, 12, tzinfo=TZ), 71743),
     ]
     assert backfill.total == 71743
     assert backfill.meter_start == datetime(2026, 10, 8, 21, tzinfo=TZ)
+
+
+def test_backfill_has_a_row_for_every_day_a_late_change_can_reach() -> None:
+    meter = DrivingMeter()
+    meter.update(rows(d20261006=25516), {}, NOW)
+    backfill = backfill_statistics(meter.energy, TZ)
+    assert backfill is not None
+    oldest = date(2026, 10, 8) - ROW_RETENTION
+    days = [oldest + timedelta(days=n) for n in range(ROW_RETENTION.days + 1)]
+    assert [hour for hour, _ in backfill.rows] == [
+        datetime.combine(day, time(12), TZ) for day in days
+    ]
+    assert backfill.rows[0][1] == 0
+    # A change to the undriven 10-07 lands on its own row, not on 10-08's.
+    hour = meter.energy.late_hour(date(2026, 10, 7), TZ)
+    assert (hour, 25516) in backfill.rows
 
 
 def test_backfill_moves_start_day_before_a_morning_install() -> None:
@@ -405,7 +474,8 @@ def test_backfill_moves_start_day_before_a_morning_install() -> None:
     backfill = backfill_statistics(meter.energy, TZ)
     assert backfill is not None
     # The last full hour before the meter's first state.
-    assert backfill.rows == [(datetime(2026, 10, 8, 8, tzinfo=TZ), 500)]
+    assert backfill.rows[-1] == (datetime(2026, 10, 8, 8, tzinfo=TZ), 500)
+    assert backfill.rows[-2] == (datetime(2026, 10, 7, 12, tzinfo=TZ), 0)
     assert backfill.meter_start == datetime(2026, 10, 8, 9, tzinfo=TZ)
 
 
@@ -416,11 +486,39 @@ def test_backfill_merges_days_that_share_an_hour() -> None:
     meter.update(rows(d20261007=300, d20261008=500, d20261009=200), {}, morning)
     backfill = backfill_statistics(meter.energy, TZ)
     assert backfill is not None
-    assert backfill.rows == [
+    assert backfill.rows[-2:] == [
         (datetime(2026, 10, 7, 12, tzinfo=TZ), 300),
         (datetime(2026, 10, 8, 8, tzinfo=TZ), 1000),
     ]
     assert backfill.total == 1000
+
+
+def test_statistics_hours_are_utc_hours_half_an_hour_off_utc() -> None:
+    kolkata = ZoneInfo("Asia/Kolkata")
+    meter = DrivingMeter()
+    meter.update(
+        rows(d20261006=25516), {}, datetime(2026, 10, 8, 21, 7, tzinfo=kolkata)
+    )
+    backfill = backfill_statistics(meter.energy, kolkata)
+    assert backfill is not None
+    assert backfill.meter_start == datetime(2026, 10, 8, 15, tzinfo=dt_util.UTC)
+    assert all(hour.astimezone(dt_util.UTC).minute == 0 for hour, _ in backfill.rows)
+    assert meter.energy.late_hour(date(2026, 10, 9), kolkata) == datetime(
+        2026, 10, 9, 17, tzinfo=dt_util.UTC
+    )
+    reported = datetime(2026, 10, 9, 10, 22, tzinfo=kolkata)
+    assert sensor_platform._short_term_period(reported) == datetime(
+        2026, 10, 9, 4, 50, tzinfo=dt_util.UTC
+    )
+
+
+def test_backfill_ends_before_a_start_just_after_spring_forward() -> None:
+    meter = DrivingMeter()
+    meter.update(rows(d20260329=500), {}, datetime(2026, 3, 29, 3, 20, tzinfo=TZ))
+    backfill = backfill_statistics(meter.energy, TZ)
+    assert backfill is not None
+    assert backfill.rows[-1] == (datetime(2026, 3, 29, 0, tzinfo=dt_util.UTC), 500)
+    assert backfill.meter_start == datetime(2026, 3, 29, 1, tzinfo=dt_util.UTC)
 
 
 def test_backfill_needs_a_started_meter() -> None:
@@ -516,17 +614,36 @@ async def test_tracker_marks_backfilled_and_backdated() -> None:
 # The sensors
 
 
+async def _set_up(
+    monkeypatch: pytest.MonkeyPatch,
+    vehicle: Vehicle,
+    store: FakeStore | None = None,
+    options: dict[str, Any] | None = None,
+) -> tuple[Any, Any, Any, list[Any]]:
+    """Set the entry up as ``__init__`` does, then its sensor platform.
+
+    Return hass, the config entry, the coordinator and the sensors.
+    """
+    monkeypatch.setattr(driving_energy, "Store", lambda *args: store or FakeStore())
+    monkeypatch.setattr(dt_util, "now", lambda: NOW)
+    coordinator = make_coordinator(vehicle)
+    hass, config_entry = make_hass(coordinator)
+    config_entry.options = options or {}
+    coordinator.driving_meters = await driving_energy.async_setup_driving_meters(
+        hass, config_entry, coordinator
+    )
+    created: list[Any] = []
+    await sensor_platform.async_setup_entry(hass, config_entry, created.extend)
+    return hass, config_entry, coordinator, created
+
+
 async def _set_up_sensors(
     monkeypatch: pytest.MonkeyPatch,
     vehicle: Vehicle,
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the sensors set up for ``vehicle``, by unique id less its prefix."""
-    monkeypatch.setattr(sensor_platform, "Store", lambda *args: FakeStore())
-    hass, config_entry = make_hass(make_coordinator(vehicle))
-    config_entry.options = options or {}
-    created: list[Any] = []
-    await sensor_platform.async_setup_entry(hass, config_entry, created.extend)
+    *_, created = await _set_up(monkeypatch, vehicle, options=options)
     return {entity.unique_id.removeprefix("kia_uvo_v1_"): entity for entity in created}
 
 
@@ -543,6 +660,62 @@ async def test_sensor_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     assert distance.native_value == 82
     assert distance.unique_id == "kia_uvo_v1_driving_distance"
     assert distance.native_unit_of_measurement == "km"
+
+
+async def test_meter_work_runs_as_tasks_of_the_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reload waits for them, and none starts before Home Assistant has."""
+    hass, config_entry, coordinator, created = await _set_up(
+        monkeypatch, ev(rows(d20261006=13089))
+    )
+
+    schedule_process = coordinator.async_add_listener.call_args.args[0]
+    coordinator.last_update_success = False
+    schedule_process()
+    config_entry.async_create_task.assert_not_called()
+    coordinator.last_update_success = True
+    schedule_process()
+    energy = next(e for e in created if e.unique_id == "kia_uvo_v1_driving_energy")
+    energy.hass = hass
+    energy._schedule_statistics_update()
+    hass.state = CoreState.running
+    energy._schedule_statistics_update()
+
+    names = [call.args[2] for call in config_entry.async_create_task.call_args_list]
+    assert names == [
+        "kia_uvo driving meters v1",
+        f"kia_uvo {energy.entity_id} statistics",
+    ]
+    for call in config_entry.async_create_task.call_args_list:
+        call.args[1].close()
+    hass.async_create_task.assert_not_called()
+
+
+async def test_tracker_outlives_a_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    vehicle = ev(rows(d20261006=13089))
+    hass, config_entry, coordinator, _ = await _set_up(monkeypatch, vehicle)
+    tracker = coordinator.driving_meters["v1"]
+    reloaded = make_coordinator(ev(rows(d20261006=14089)))
+    found = await driving_energy.async_setup_driving_meters(
+        hass, config_entry, reloaded
+    )
+    assert found["v1"] is tracker
+    assert tracker.vehicle is reloaded.vehicle_manager.vehicles["v1"]
+    assert tracker.meter.energy.late == late(d20261006=1000)
+
+
+async def test_unreadable_meter_store_leaves_the_other_sensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeStore()
+    store.data = {"energy": {}}
+    hass, *_, created = await _set_up(monkeypatch, ev(rows(d20261006=13089)), store)
+    keys = {entity.unique_id.removeprefix("kia_uvo_v1_") for entity in created}
+    assert "total_power_consumed" in keys
+    assert "driving_energy" not in keys
+    assert store.data == {"energy": {}}
+    assert hass.data[driving_energy.DRIVING_METERS] == {}
 
 
 async def test_lifetime_estimate_sensor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -580,6 +753,10 @@ async def _started_sensors(
     )
     fake_recorder = FakeRecorder()
     monkeypatch.setattr(sensor_platform, "get_instance", lambda hass: fake_recorder)
+    statistics = fake_recorder.statistics
+    monkeypatch.setattr(sensor_platform, "get_last_statistics", statistics.last)
+    monkeypatch.setattr(sensor_platform, "statistics_during_period", statistics.during)
+    monkeypatch.setattr(sensor_platform, "get_metadata", statistics.metadata)
     monkeypatch.setattr(dt_util, "now", lambda: NOW)
     monkeypatch.setattr(dt_util, "get_default_time_zone", lambda: TZ)
     sensors = {
@@ -629,7 +806,7 @@ async def test_sensor_imports_backfill_once(monkeypatch: pytest.MonkeyPatch) -> 
     assert metadata["source"] == "recorder"
     assert metadata["unit_class"] == "energy"
     assert metadata["unit_of_measurement"] == "kWh"
-    assert [s["sum"] for s in stats] == [26.762, pytest.approx(39.851)]
+    assert [s["sum"] for s in stats][-5:] == [0, 26.762] + [pytest.approx(39.851)] * 3
     # The states lead up to the sensor's first state.
     assert [s["state"] for s in stats] == [s["sum"] for s in stats]
     assert energy.native_value == 39851
@@ -646,7 +823,7 @@ async def test_sensor_imports_backfill_once(monkeypatch: pytest.MonkeyPatch) -> 
     await sensors["driving_distance"]._async_update_statistics()
     metadata, stats = imported[1]
     assert metadata["unit_class"] == "distance"
-    assert [s["sum"] for s in stats] == [167, 249]
+    assert [s["sum"] for s in stats][-4:] == [167, 249, 249, 249]
 
 
 async def test_sensor_waits_for_short_term_statistics(
@@ -729,6 +906,99 @@ async def test_sensor_moves_late_change_once_its_period_is_compiled(
     await energy._async_update_statistics()
     assert [adjustment[2] for adjustment in fake_recorder.adjusted] == [1600, -1600]
     assert energy._tracker.meter.energy.late == []
+
+
+LATER = datetime(2026, 10, 9, 8, 2, tzinfo=TZ)
+
+
+async def _report_late_on_the_start_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, FakeRecorder]:
+    """Return the energy sensor, backfilled, with 500 Wh reported late for 10-08."""
+    vehicle = ev(rows(d20261006=13089))
+    sensors, _, fake_recorder = await _started_sensors(monkeypatch, vehicle)
+    energy = sensors["driving_energy"]
+    await energy._async_update_statistics()
+    fake_recorder.adjusted.clear()
+    energy._tracker._now = lambda: LATER
+    vehicle.daily_stats = daily_stats(rows(d20261006=13089, d20261008=500))
+    await energy._tracker.async_process()
+    assert energy._tracker.meter.energy.late == late(LATER, d20261008=500)
+    compile_up_to(monkeypatch, LATER)
+    return energy, fake_recorder
+
+
+def utc(day: int, hour: int) -> datetime:
+    return datetime(2026, 10, day, hour, tzinfo=dt_util.UTC)
+
+
+async def test_late_change_books_on_the_last_compiled_hour_of_its_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    energy, fake_recorder = await _report_late_on_the_start_day(monkeypatch)
+    # Unavailable from 22:00 local: no 22:00 and 23:00 rows.
+    fake_recorder.statistics.missing = {utc(8, 20), utc(8, 21)}
+    await energy._async_update_statistics()
+    assert [(a[1], a[2]) for a in fake_recorder.adjusted] == [
+        (utc(8, 19), 500),
+        (datetime(2026, 10, 9, 8, tzinfo=TZ), -500),
+    ]
+    assert energy._tracker.meter.energy.late == []
+
+
+async def test_late_change_to_a_day_without_statistics_gets_a_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    energy, fake_recorder = await _report_late_on_the_start_day(monkeypatch)
+    statistics = fake_recorder.statistics
+    statistics.missing = {utc(7, 22) + timedelta(hours=n) for n in range(24)}
+    statistics.units["sensor.ev6_driving_energy"] = "Wh"
+    imported: list[Any] = []
+    monkeypatch.setattr(
+        sensor_platform,
+        "async_import_statistics",
+        lambda hass, metadata, stats: imported.append((metadata, list(stats))),
+    )
+    await energy._async_update_statistics()
+    ((metadata, stats),) = imported
+    assert metadata["unit_of_measurement"] == "Wh"
+    # 23:00 local, carrying the sum and state of the last row before it.
+    assert stats == [{"start": utc(8, 21), "state": 7.0, "sum": 7.0}]
+    assert fake_recorder.adjusted[0][1:3] == (utc(8, 21), 500)
+
+
+async def test_late_change_waits_until_its_hour_is_compiled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    energy, fake_recorder = await _report_late_on_the_start_day(monkeypatch)
+    fake_recorder.statistics.compiled = utc(8, 20)
+    await energy._async_update_statistics()
+    assert fake_recorder.adjusted == []
+    assert energy._tracker.meter.energy.late == late(LATER, d20261008=500)
+
+
+async def test_reloaded_sensor_waits_for_its_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """However long the recorder takes, the work is done once."""
+    vehicle = ev(rows(d20261005=26762, d20261006=13089))
+    sensors, imported, fake_recorder = await _started_sensors(monkeypatch, vehicle)
+    old = sensors["driving_energy"]
+    new = sensor_platform.DrivingMeterSensor(
+        old.coordinator, MagicMock(), vehicle, old._tracker, old.entity_description
+    )
+    new.hass, new.entity_id = old.hass, old.entity_id
+
+    fake_recorder.commit = asyncio.get_running_loop().create_future()
+    first = asyncio.create_task(old._async_update_statistics())
+    await asyncio.sleep(0)
+    second = asyncio.create_task(new._async_update_statistics())
+    await asyncio.sleep(0)
+    fake_recorder.commit.set_result(None)
+    await asyncio.gather(first, second)
+    assert len(imported) == 1
+    assert len(fake_recorder.adjusted) == 1
+    assert old._tracker.meter.energy.backfilled
 
 
 async def test_sensor_marks_changes_done_only_once_committed(
