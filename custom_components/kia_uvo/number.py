@@ -11,7 +11,7 @@ from homeassistant.components.number import (
     NumberMode,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfEnergyDistance
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -19,6 +19,7 @@ from hyundai_kia_connect_api import Vehicle
 
 from .const import DOMAIN, DYNAMIC_UNIT
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
+from .driving_energy import DrivingMeterTracker
 from .entity import HyundaiKiaConnectEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up number entities from a config entry."""
     coordinator = hass.data[DOMAIN][config_entry.unique_id]
-    entities = []
+    entities: list[NumberEntity] = []
     for vehicle_id in coordinator.vehicle_manager.vehicles:
         vehicle: Vehicle = coordinator.vehicle_manager.vehicles[vehicle_id]
         for description in NUMBER_DESCRIPTIONS:
@@ -73,6 +74,12 @@ async def async_setup_entry(
                 entities.append(
                     HyundaiKiaConnectNumber(coordinator, description, vehicle)
                 )
+    for vehicle_id, tracker in coordinator.driving_meters.items():
+        entities.append(
+            LifetimeAverageConsumptionNumber(
+                coordinator, coordinator.vehicle_manager.vehicles[vehicle_id], tracker
+            )
+        )
 
     async_add_entities(entities)
 
@@ -183,3 +190,52 @@ class HyundaiKiaConnectNumber(NumberEntity, HyundaiKiaConnectEntity):
             return cast(str | None, getattr(self.vehicle, self._key + "_unit"))
         else:
             return self.entity_description.native_unit_of_measurement
+
+
+class LifetimeAverageConsumptionNumber(NumberEntity, HyundaiKiaConnectEntity):
+    """The car's lifetime average consumption, for the lifetime estimate.
+
+    Until it is set, it shows the API's 30-day average from when the driving
+    meter started, which the estimate then uses.
+    """
+
+    _attr_translation_key = "lifetime_average_consumption"
+    _attr_icon = "mdi:car-electric"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_mode = NumberMode.BOX
+    _attr_native_min_value = 1
+    _attr_native_max_value = 100
+    _attr_native_step = 0.1
+    _attr_native_unit_of_measurement = UnitOfEnergyDistance.KILO_WATT_HOUR_PER_100_KM
+
+    def __init__(
+        self,
+        coordinator: HyundaiKiaConnectDataUpdateCoordinator,
+        vehicle: Vehicle,
+        tracker: DrivingMeterTracker,
+    ) -> None:
+        """Initialize the number."""
+        super().__init__(coordinator, vehicle)
+        self._tracker = tracker
+        self._attr_unique_id = f"{DOMAIN}_{vehicle.id}_lifetime_average_consumption"
+
+    async def async_added_to_hass(self) -> None:
+        """Publish whenever the tracker has saved a change."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self._tracker.add_listener(self.async_write_ha_state))
+
+    @property
+    def available(self) -> bool:
+        """Return True: the value is kept here, not in the car."""
+        return True
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the average the estimate uses, in kWh/100 km."""
+        wh_per_km = self._tracker.meter.lifetime_average_wh_per_km
+        # kWh/100 km equals 10 Wh/km.
+        return round(wh_per_km / 10, 2) if wh_per_km is not None else None
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Set the car's lifetime average."""
+        await self._tracker.async_set_average(value * 10)

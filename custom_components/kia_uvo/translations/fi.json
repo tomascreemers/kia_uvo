@@ -428,6 +428,9 @@
       "last_scanned_at": {
         "name": "Viimeisin tarkistus"
       },
+      "lifetime_driving_energy_estimate": {
+        "name": "Lifetime Driving Energy (Estimate)"
+      },
       "ev_battery_percentage": {
         "name": "Ajoakun varaus"
       },
@@ -941,6 +944,9 @@
       },
       "ev_v2l_discharge_limit": {
         "name": "V2L-raja"
+      },
+      "lifetime_average_consumption": {
+        "name": "Lifetime Average Consumption"
       }
     },
     "device_tracker": {

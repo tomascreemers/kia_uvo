@@ -512,6 +512,9 @@
       "last_scanned_at": {
         "name": "Letzter Scan"
       },
+      "lifetime_driving_energy_estimate": {
+        "name": "Lifetime Driving Energy (Estimate)"
+      },
       "next_service_distance": {
         "name": "Entfernung bis nächster Service"
       },
@@ -941,6 +944,9 @@
       },
       "ev_v2l_discharge_limit": {
         "name": "V2L-Grenze"
+      },
+      "lifetime_average_consumption": {
+        "name": "Lifetime Average Consumption"
       }
     },
     "device_tracker": {

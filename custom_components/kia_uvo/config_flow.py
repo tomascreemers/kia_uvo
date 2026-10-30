@@ -29,7 +29,6 @@ from .const import (
     CONF_BRAND,
     CONF_ENABLE_GEOLOCATION_ENTITY,
     CONF_FORCE_REFRESH_INTERVAL,
-    CONF_LIFETIME_AVERAGE_CONSUMPTION,
     CONF_NO_FORCE_REFRESH_HOUR_FINISH,
     CONF_NO_FORCE_REFRESH_HOUR_START,
     CONF_TOKEN,
@@ -127,10 +126,6 @@ OPTIONS_SCHEMA = vol.Schema(
             CONF_USE_EMAIL_WITH_GEOCODE_API,
             default=DEFAULT_USE_EMAIL_WITH_GEOCODE_API,
         ): bool,
-        # kWh/100 km, as shown by the car; only feeds the lifetime estimate.
-        vol.Optional(CONF_LIFETIME_AVERAGE_CONSUMPTION): vol.All(
-            vol.Coerce(float), vol.Range(min=1, max=100)
-        ),
     }
 )
 

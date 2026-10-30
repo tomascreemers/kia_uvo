@@ -428,6 +428,9 @@
       "last_scanned_at": {
         "name": "Última exploración"
       },
+      "lifetime_driving_energy_estimate": {
+        "name": "Lifetime Driving Energy (Estimate)"
+      },
       "ev_battery_percentage": {
         "name": "Nivel de Batería EV"
       },
@@ -941,6 +944,9 @@
       },
       "ev_v2l_discharge_limit": {
         "name": "Límite V2L"
+      },
+      "lifetime_average_consumption": {
+        "name": "Lifetime Average Consumption"
       }
     },
     "device_tracker": {

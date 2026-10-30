@@ -278,6 +278,8 @@ class DrivingMeter:
     energy_regenerated: DailyTotal = field(default_factory=DailyTotal)
     odometer_at_start_km: float | None = None
     api_wh_per_km_at_start: float | None = None
+    # The car's lifetime average, if the user set it; it replaces the API's.
+    average_wh_per_km: float | None = None
     # The API's energy total over a rolling 90-day window. Its per-month
     # breakdown (not exposed by the library) shows the oldest month shrinking
     # day by day, so it is not whole calendar months.
@@ -340,10 +342,16 @@ class DrivingMeter:
             self.window_carry_wh = min(excess, 0.0)
         self.window_wh = window_wh
 
-    def lifetime_estimate_wh(self, wh_per_km: float | None) -> float | None:
+    @property
+    def lifetime_average_wh_per_km(self) -> float | None:
+        """Return the average the lifetime estimate uses."""
+        if self.average_wh_per_km is not None:
+            return self.average_wh_per_km
+        return self.api_wh_per_km_at_start
+
+    def lifetime_estimate_wh(self) -> float | None:
         """Estimate lifetime driving energy: start odometer x average + measured."""
-        if wh_per_km is None:
-            wh_per_km = self.api_wh_per_km_at_start
+        wh_per_km = self.lifetime_average_wh_per_km
         if (
             not self.energy.initialized
             or self.odometer_at_start_km is None
@@ -360,6 +368,7 @@ class DrivingMeter:
             **{part: self.daily_total(part).as_dict() for part in ENERGY_PARTS},
             "odometer_at_start_km": self.odometer_at_start_km,
             "api_wh_per_km_at_start": self.api_wh_per_km_at_start,
+            "average_wh_per_km": self.average_wh_per_km,
             "window_wh": self.window_wh,
             "window_carry_wh": self.window_carry_wh,
             "missed_wh": self.missed_wh,
@@ -379,6 +388,7 @@ class DrivingMeter:
             # Missing from meters saved before the estimate existed.
             odometer_at_start_km=data.get("odometer_at_start_km"),
             api_wh_per_km_at_start=data.get("api_wh_per_km_at_start"),
+            average_wh_per_km=data.get("average_wh_per_km"),
             window_wh=data["window_wh"],
             window_carry_wh=data["window_carry_wh"],
             missed_wh=data["missed_wh"],
@@ -446,14 +456,7 @@ def daily_part_rows(vehicle: Vehicle) -> dict[EnergyPart, dict[date, float]]:
 def daily_distance_rows(vehicle: Vehicle) -> dict[date, float]:
     """Return the vehicle's driving distance (km) per day."""
 
-    def km(day: DailyDrivingStats) -> float | None:
-        if day.distance is None:
-            return None
-        if day.distance_unit == LENGTH_MILES:
-            return float(day.distance) * KM_PER_MILE
-        return float(day.distance)
-
-    return _daily_rows(vehicle, km)
+    return _daily_rows(vehicle, lambda day: _km(day.distance, day.distance_unit))
 
 
 def _daily_rows(
@@ -468,10 +471,13 @@ def _daily_rows(
 
 def odometer_km(vehicle: Vehicle) -> float | None:
     """Return the odometer in km, or None when unknown."""
-    value = vehicle.odometer
+    return _km(vehicle.odometer, vehicle.odometer_unit)
+
+
+def _km(value: float | None, unit: str | None) -> float | None:
     if value is None:
         return None
-    if vehicle.odometer_unit == LENGTH_MILES:
+    if unit == LENGTH_MILES:
         return float(value) * KM_PER_MILE
     return float(value)
 
@@ -632,6 +638,15 @@ class DrivingMeterTracker:
                 self.meter.window_wh,
                 self.meter.window_carry_wh,
             )
+
+    async def async_set_average(self, wh_per_km: float) -> None:
+        """Set the car's lifetime average consumption, then notify."""
+
+        def set_average(meter: DrivingMeter) -> None:
+            meter.average_wh_per_km = wh_per_km
+
+        if await self._async_change(set_average) is not None:
+            self._notify()
 
     async def async_mark_backfilled(self, quantity: Quantity) -> None:
         """Record that the days before ``quantity``'s start were imported."""
