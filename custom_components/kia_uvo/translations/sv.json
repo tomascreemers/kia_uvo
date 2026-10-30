@@ -572,6 +572,21 @@
       "driving_energy": {
         "name": "Driving Energy"
       },
+      "driving_energy_battery_care": {
+        "name": "Driving Energy Battery Care"
+      },
+      "driving_energy_climate": {
+        "name": "Driving Energy Climate"
+      },
+      "driving_energy_electronics": {
+        "name": "Driving Energy Electronics"
+      },
+      "driving_energy_motor": {
+        "name": "Driving Energy Motor"
+      },
+      "driving_energy_regenerated": {
+        "name": "Driving Energy Regenerated"
+      },
       "daily_driving_stats": {
         "name": "Daglig körstatistik"
       },
