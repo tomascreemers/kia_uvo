@@ -68,7 +68,8 @@
     "error": {
       "invalid_auth": "Impossibile effettuare il login nei server Hyundai (Bluelink) / Kia (Uvo) Connect. Utilizza l'app ufficiale per effettuare il logout, accedere nuovamente e riprovare!",
       "invalid_credentials": "Nome utente o password non validi",
-      "unknown": "Errore imprevisto"
+      "unknown": "Errore imprevisto",
+      "password_truncated_hint": "Autenticazione non riuscita. Se la password supera 20 caratteri, l'account potrebbe accettare solo i primi 20 (osservato su conti europei Hyundai/Kia/Genesis quando la password è stata impostata su un telefono). Prova i primi 20 caratteri."
     }
   },
   "options": {
@@ -586,6 +587,41 @@
       },
       "svm_status": {
         "name": "Stato SVM"
+      },
+      "gear_position": {
+        "name": "Posizione della marcia"
+      },
+      "steering_wheel_heat_step": {
+        "name": "Livello riscaldamento del volante"
+      },
+      "average_fuel_economy_accumulated": {
+        "name": "Consumo medio (totale)"
+      },
+      "average_fuel_economy_drive": {
+        "name": "Consumo medio (tragitto)"
+      },
+      "average_fuel_economy_after_refuel": {
+        "name": "Consumo medio (dopo rifornimento)"
+      },
+      "ev_v2l_discharge_dte": {
+        "name": "Autonomia scarico V2L"
+      },
+      "ev_v2l_discharge_remain_time": {
+        "name": "Tempo scarico restante V2L"
+      },
+      "ev_v2l_mode": {
+        "name": "Modalità V2L"
+      },
+      "ev_connector_lock_state": {
+        "name": "Stato di blocco del connettore di ricarica",
+        "state": {
+          "idle": "Idle",
+          "unlocked": "Unlocked",
+          "locked": "Locked",
+          "releasing": "Releasing",
+          "locking": "Locking",
+          "released": "Released"
+        }
       }
     },
     "binary_sensor": {
@@ -907,6 +943,15 @@
       },
       "ev_off_peak_charge_only_enabled": {
         "name": "Ricarica solo fuori picco"
+      },
+      "ev_charge_complete_alarm_before_10min": {
+        "name": "Avviso ricarica completata (10 min prima)"
+      },
+      "ev_charge_complete_alarm_before_20min": {
+        "name": "Avviso ricarica completata (20 min prima)"
+      },
+      "ev_charge_complete_alarm_before_30min": {
+        "name": "Avviso ricarica completata (30 min prima)"
       },
       "ev_schedule_charge_enabled": {
         "name": "Ricarica programmata"

@@ -68,7 +68,8 @@
     "error": {
       "invalid_auth": "Login fejlede til Hyundai (Bluelink) / Kia (Uvo) Connect-servere. Brug den officielle app til at logge ud og logge ind igen, og prøv derefter igen!",
       "invalid_credentials": "Ugyldigt brugernavn eller adgangskode",
-      "unknown": "Uventet fejl"
+      "unknown": "Uventet fejl",
+      "password_truncated_hint": "Authentication failed. If your password is longer than 20 characters, the account may only accept the first 20 of them (observed on European Hyundai/Kia/Genesis accounts when the password was set on a mobile phone). Try the first 20 characters of your password."
     }
   },
   "options": {
@@ -586,6 +587,41 @@
       },
       "svm_status": {
         "name": "SVM-status"
+      },
+      "gear_position": {
+        "name": "Gearposition"
+      },
+      "steering_wheel_heat_step": {
+        "name": "Niveau for rattvarme"
+      },
+      "average_fuel_economy_accumulated": {
+        "name": "Gennemsnitsforbrug (total)"
+      },
+      "average_fuel_economy_drive": {
+        "name": "Gennemsnitsforbrug (tur)"
+      },
+      "average_fuel_economy_after_refuel": {
+        "name": "Gennemsnitsforbrug (efter tankning)"
+      },
+      "ev_v2l_discharge_dte": {
+        "name": "V2L restvidde (afladning)"
+      },
+      "ev_v2l_discharge_remain_time": {
+        "name": "V2L resterende tid (afladning)"
+      },
+      "ev_v2l_mode": {
+        "name": "V2L-tilstand"
+      },
+      "ev_connector_lock_state": {
+        "name": "Låsetilstand for ladekontakten",
+        "state": {
+          "idle": "Idle",
+          "unlocked": "Unlocked",
+          "locked": "Locked",
+          "releasing": "Releasing",
+          "locking": "Locking",
+          "released": "Released"
+        }
       }
     },
     "binary_sensor": {
@@ -907,6 +943,15 @@
       },
       "ev_off_peak_charge_only_enabled": {
         "name": "Kun lavprisopladning"
+      },
+      "ev_charge_complete_alarm_before_10min": {
+        "name": "Fuldladningsalarm (10 min før)"
+      },
+      "ev_charge_complete_alarm_before_20min": {
+        "name": "Fuldladningsalarm (20 min før)"
+      },
+      "ev_charge_complete_alarm_before_30min": {
+        "name": "Fuldladningsalarm (30 min før)"
       },
       "ev_schedule_charge_enabled": {
         "name": "Planlagt opladning"
