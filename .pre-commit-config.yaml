@@ -3,7 +3,7 @@ ci:
   autoupdate_commit_msg: "chore: pre-commit autoupdate"
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.2
+    rev: v0.17.4
     hooks:
       - id: ruff
         args:
@@ -50,13 +50,6 @@ repos:
       - id: python-typing-update
         stages: [manual]
         args:
-          - --py311-plus
+          - --py314-plus
           - --force
           - --keep-updates
-        files: ^(/.+)?[^/]+\.py$
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.4.0
-    hooks:
-      - id: mypy
-        args: [--strict, --ignore-missing-imports]
-        files: ^(/.+)?[^/]+\.py$
