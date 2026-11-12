@@ -68,7 +68,8 @@
     "error": {
       "invalid_auth": "Het authenticeren op de Hyundai (Bluelink) / Kia (Uvo) Connect servers is niet gelukt. Gebruik svp de officiële app om uit te loggen en weer in te loggen, en probeer het dan opnieuw!",
       "invalid_credentials": "Ongeldige gebruikersnaam of wachtwoord",
-      "unknown": "Onverwachte foutsituatie"
+      "unknown": "Onverwachte foutsituatie",
+      "password_truncated_hint": "Authenticatie mislukt. Als je wachtwoord langer is dan 20 tekens, accepteert het account mogelijk alleen de eerste 20 (gezien bij Europese Hyundai/Kia/Genesis-accounts toen het wachtwoord op een telefoon werd ingesteld). Probeer de eerste 20 tekens."
     }
   },
   "options": {
@@ -610,6 +611,41 @@
       },
       "svm_status": {
         "name": "SVM-status"
+      },
+      "gear_position": {
+        "name": "Versnellingsstand"
+      },
+      "steering_wheel_heat_step": {
+        "name": "Niveau stuurverwarming"
+      },
+      "average_fuel_economy_accumulated": {
+        "name": "Gemiddeld verbruik (totaal)"
+      },
+      "average_fuel_economy_drive": {
+        "name": "Gemiddeld verbruik (rit)"
+      },
+      "average_fuel_economy_after_refuel": {
+        "name": "Gemiddeld verbruik (na het tanken)"
+      },
+      "ev_v2l_discharge_dte": {
+        "name": "Resterend V2L-bereik"
+      },
+      "ev_v2l_discharge_remain_time": {
+        "name": "Resterende V2L-tijd"
+      },
+      "ev_v2l_mode": {
+        "name": "V2L-modus"
+      },
+      "ev_connector_lock_state": {
+        "name": "Vergrendelstatus laadconnector",
+        "state": {
+          "idle": "Idle",
+          "unlocked": "Unlocked",
+          "locked": "Locked",
+          "releasing": "Releasing",
+          "locking": "Locking",
+          "released": "Released"
+        }
       }
     },
     "binary_sensor": {
@@ -931,6 +967,15 @@
       },
       "ev_off_peak_charge_only_enabled": {
         "name": "Alleen laden tijdens daltarief"
+      },
+      "ev_charge_complete_alarm_before_10min": {
+        "name": "Melding volledig opgeladen (10 min van tevoren)"
+      },
+      "ev_charge_complete_alarm_before_20min": {
+        "name": "Melding volledig opgeladen (20 min van tevoren)"
+      },
+      "ev_charge_complete_alarm_before_30min": {
+        "name": "Melding volledig opgeladen (30 min van tevoren)"
       },
       "ev_schedule_charge_enabled": {
         "name": "Gepland laden"

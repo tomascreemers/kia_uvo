@@ -17,7 +17,7 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from hyundai_kia_connect_api import Vehicle
-from hyundai_kia_connect_api.const import SEAT_STATUS
+from hyundai_kia_connect_api.const import ENGINE_TYPES, SEAT_STATUS
 
 from .const import DOMAIN
 from .coordinator import HyundaiKiaConnectDataUpdateCoordinator
@@ -33,6 +33,7 @@ class HyundaiKiaBinarySensorEntityDescription(BinarySensorEntityDescription):
     is_on: Callable[[Vehicle], bool | None] | None = None
     on_icon: str | None = None
     off_icon: str | None = None
+    exists: Callable[[Vehicle], bool] | None = None
 
 
 def _raw_flag(value: int | None) -> bool | None:
@@ -195,6 +196,10 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaBinarySensorEntityDescription, ...]] 
         is_on=lambda vehicle: vehicle.ev_battery_is_plugged_in,
         device_class=BinarySensorDeviceClass.PLUG,
         entity_category=EntityCategory.DIAGNOSTIC,
+        exists=lambda vehicle: (
+            vehicle.engine_type in (ENGINE_TYPES.EV, ENGINE_TYPES.PHEV)
+            or vehicle.ev_battery_is_plugged_in is not None
+        ),
     ),
     HyundaiKiaBinarySensorEntityDescription(
         key="fuel_level_is_low",
@@ -218,7 +223,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaBinarySensorEntityDescription, ...]] 
         translation_key="air_cleaning_is_on",
         is_on=lambda vehicle: vehicle.air_cleaning_is_on,
         on_icon="mdi:air-filter",
-        off_icon="mdi:air-filter-off",
+        off_icon="mdi:air-filter",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     HyundaiKiaBinarySensorEntityDescription(
@@ -226,7 +231,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaBinarySensorEntityDescription, ...]] 
         translation_key="auto_cut_battery_prewarning_on",
         is_on=lambda vehicle: vehicle.auto_cut_battery_prewarning_on,
         on_icon="mdi:battery-alert",
-        off_icon="mdi:battery-alert-outline",
+        off_icon="mdi:battery-alert-variant-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     HyundaiKiaBinarySensorEntityDescription(
@@ -490,7 +495,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaBinarySensorEntityDescription, ...]] 
         key="front_left_seat_heater_on",
         translation_key="front_left_seat_heater_on",
         is_on=lambda vehicle: _seat_heater_on(vehicle.front_left_seat_status),
-        on_icon="mdi:seat-heater",
+        on_icon="mdi:car-seat-heater",
         off_icon="mdi:seat-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
@@ -498,7 +503,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaBinarySensorEntityDescription, ...]] 
         key="front_right_seat_heater_on",
         translation_key="front_right_seat_heater_on",
         is_on=lambda vehicle: _seat_heater_on(vehicle.front_right_seat_status),
-        on_icon="mdi:seat-heater",
+        on_icon="mdi:car-seat-heater",
         off_icon="mdi:seat-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
@@ -506,7 +511,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaBinarySensorEntityDescription, ...]] 
         key="rear_left_seat_heater_on",
         translation_key="rear_left_seat_heater_on",
         is_on=lambda vehicle: _seat_heater_on(vehicle.rear_left_seat_status),
-        on_icon="mdi:seat-heater",
+        on_icon="mdi:car-seat-heater",
         off_icon="mdi:seat-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
@@ -514,7 +519,7 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaBinarySensorEntityDescription, ...]] 
         key="rear_right_seat_heater_on",
         translation_key="rear_right_seat_heater_on",
         is_on=lambda vehicle: _seat_heater_on(vehicle.rear_right_seat_status),
-        on_icon="mdi:seat-heater",
+        on_icon="mdi:car-seat-heater",
         off_icon="mdi:seat-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
@@ -618,7 +623,12 @@ async def async_setup_entry(
     for vehicle_id in coordinator.vehicle_manager.vehicles:
         vehicle: Vehicle = coordinator.vehicle_manager.vehicles[vehicle_id]
         for description in SENSOR_DESCRIPTIONS:
-            if getattr(vehicle, description.key, None) is not None:
+            create = (
+                description.exists(vehicle)
+                if description.exists is not None
+                else getattr(vehicle, description.key, None) is not None
+            )
+            if create:
                 entities.append(
                     HyundaiKiaConnectBinarySensor(coordinator, description, vehicle)
                 )
