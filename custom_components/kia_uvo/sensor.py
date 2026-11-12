@@ -69,11 +69,18 @@ class HyundaiKiaSensorEntityDescription(SensorEntityDescription):
     """A class that describes custom sensor entities."""
 
     exists: Callable[[Vehicle], bool] | None = None
+    value_fn: Callable[[Vehicle], StateType] | None = None
 
 
 def _is_electrified(vehicle: Vehicle) -> bool:
     """Return True for BEV and PHEV vehicles."""
     return vehicle.engine_type in (ENGINE_TYPES.EV, ENGINE_TYPES.PHEV)
+
+
+def _connector_lock_state_name(vehicle: Vehicle) -> str | None:
+    """Return the lowercase enum name, or None while unknown."""
+    state = vehicle.ev_connector_lock_state
+    return None if state is None else state.name.lower()
 
 
 SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
@@ -155,6 +162,8 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
         native_unit_of_measurement=PERCENTAGE,
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
+        # The lib keeps the 255 sentinel (kia_uvo #1935) unknown.
+        exists=_is_electrified,
     ),
     HyundaiKiaSensorEntityDescription(
         key="ev_battery_remain",
@@ -356,6 +365,13 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
         key="ev_off_peak_end_time",
         translation_key="ev_off_peak_end_time",
         icon="mdi:clock-outline",
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="ev_connector_lock_state",
+        translation_key="ev_connector_lock_state",
+        icon="mdi:lock",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_connector_lock_state_name,
     ),
     HyundaiKiaSensorEntityDescription(
         key="ev_charging_current",
@@ -576,6 +592,76 @@ SENSOR_DESCRIPTIONS: Final[tuple[HyundaiKiaSensorEntityDescription, ...]] = (
         key="drive_mode",
         translation_key="drive_mode",
         icon="mdi:car-cog",
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="gear_position",
+        translation_key="gear_position",
+        icon="mdi:car-shift-pattern",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="steering_wheel_heat_step",
+        translation_key="steering_wheel_heat_step",
+        icon="mdi:steering",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="ev_v2l_discharge_remain_time",
+        translation_key="ev_v2l_discharge_remain_time",
+        icon="mdi:battery-charging-low",
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+        exists=lambda vehicle: (
+            vehicle.ev_v2l_discharge_limit is not None
+            or vehicle.ev_v2l_mode is not None
+            or vehicle.ev_v2l_discharge_dte is not None
+        ),
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="ev_v2l_discharge_dte",
+        translation_key="ev_v2l_discharge_dte",
+        icon="mdi:road-variant",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        exists=lambda vehicle: (
+            vehicle.ev_v2l_discharge_limit is not None
+            or vehicle.ev_v2l_mode is not None
+            or vehicle.ev_v2l_discharge_dte is not None
+        ),
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="ev_v2l_mode",
+        translation_key="ev_v2l_mode",
+        icon="mdi:speedometer",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        exists=lambda vehicle: (
+            vehicle.ev_v2l_discharge_limit is not None
+            or vehicle.ev_v2l_mode is not None
+            or vehicle.ev_v2l_discharge_dte is not None
+        ),
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="average_fuel_economy_accumulated",
+        translation_key="average_fuel_economy_accumulated",
+        icon="mdi:gas-station",
+        native_unit_of_measurement=DYNAMIC_UNIT,
+        state_class=SensorStateClass.MEASUREMENT,
+        exists=lambda vehicle: vehicle.average_fuel_economy_unit is not None,
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="average_fuel_economy_drive",
+        translation_key="average_fuel_economy_drive",
+        icon="mdi:gas-station",
+        native_unit_of_measurement=DYNAMIC_UNIT,
+        state_class=SensorStateClass.MEASUREMENT,
+        exists=lambda vehicle: vehicle.average_fuel_economy_unit is not None,
+    ),
+    HyundaiKiaSensorEntityDescription(
+        key="average_fuel_economy_after_refuel",
+        translation_key="average_fuel_economy_after_refuel",
+        icon="mdi:gas-station",
+        native_unit_of_measurement=DYNAMIC_UNIT,
+        state_class=SensorStateClass.MEASUREMENT,
+        exists=lambda vehicle: vehicle.average_fuel_economy_unit is not None,
     ),
 )
 
@@ -993,6 +1079,8 @@ def _short_term_period(moment: datetime) -> datetime:
 class HyundaiKiaConnectSensor(RestoreSensor, SensorEntity, HyundaiKiaConnectEntity):
     """Hyundai / Kia Connect sensor class."""
 
+    entity_description: HyundaiKiaSensorEntityDescription
+
     def __init__(
         self,
         coordinator: HyundaiKiaConnectDataUpdateCoordinator,
@@ -1024,6 +1112,8 @@ class HyundaiKiaConnectSensor(RestoreSensor, SensorEntity, HyundaiKiaConnectEnti
     @property
     def native_value(self) -> StateType | datetime:
         """Return the value reported by the sensor."""
+        if self.entity_description.value_fn is not None:
+            return self.entity_description.value_fn(self.vehicle)
         value = getattr(self.vehicle, self._key)
         if self._key == "ev_charging_current":
             return CHARGING_CURRENTS.get(value, None)

@@ -68,7 +68,8 @@
     "error": {
       "invalid_auth": "Login failed into Hyundai (Bluelink) / Kia (Uvo) Connect servers. Please use the official app to logout and log back in, then try again.",
       "invalid_credentials": "Invalid username or password",
-      "unknown": "Unexpected error"
+      "unknown": "Unexpected error",
+      "password_truncated_hint": "Authentication failed. If your password is longer than 20 characters, the account may only accept the first 20 of them (observed on European Hyundai/Kia/Genesis accounts when the password was set on a mobile phone). Try the first 20 characters of your password."
     }
   },
   "options": {
@@ -488,6 +489,15 @@
       "ev_target_range_charge_dc": {
         "name": "Target Range of Charge DC"
       },
+      "ev_v2l_discharge_dte": {
+        "name": "V2L Discharge DTE"
+      },
+      "ev_v2l_discharge_remain_time": {
+        "name": "V2L Discharge Remaining Time"
+      },
+      "ev_v2l_mode": {
+        "name": "V2L Mode"
+      },
       "front_left_seat_status": {
         "name": "Front Left Seat"
       },
@@ -529,6 +539,9 @@
       },
       "rear_right_seat_status": {
         "name": "Rear Right Seat"
+      },
+      "steering_wheel_heat_step": {
+        "name": "Steering Wheel Heat Step"
       },
       "todays_daily_driving_stats": {
         "name": "Today's Daily Driving Stats"
@@ -592,6 +605,29 @@
       },
       "svm_status": {
         "name": "SVM Status"
+      },
+      "average_fuel_economy_accumulated": {
+        "name": "Average Fuel Economy (Accumulated)"
+      },
+      "average_fuel_economy_drive": {
+        "name": "Average Fuel Economy (Drive)"
+      },
+      "average_fuel_economy_after_refuel": {
+        "name": "Average Fuel Economy (After Refuel)"
+      },
+      "gear_position": {
+        "name": "Gear Position"
+      },
+      "ev_connector_lock_state": {
+        "name": "Charging connector lock state",
+        "state": {
+          "idle": "Idle",
+          "unlocked": "Unlocked",
+          "locked": "Locked",
+          "releasing": "Releasing",
+          "locking": "Locking",
+          "released": "Released"
+        }
       }
     },
     "binary_sensor": {
@@ -913,6 +949,15 @@
       },
       "ev_off_peak_charge_only_enabled": {
         "name": "Off-peak charge only"
+      },
+      "ev_charge_complete_alarm_before_10min": {
+        "name": "Charge Complete Alarm (10 min Before)"
+      },
+      "ev_charge_complete_alarm_before_20min": {
+        "name": "Charge Complete Alarm (20 min Before)"
+      },
+      "ev_charge_complete_alarm_before_30min": {
+        "name": "Charge Complete Alarm (30 min Before)"
       },
       "ev_schedule_charge_enabled": {
         "name": "Scheduled charging"

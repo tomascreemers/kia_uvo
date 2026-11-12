@@ -11,9 +11,10 @@ body:
     id: region
     attributes:
       label: Region
-      description: Select your region
+      description: Select your region. Choose "Europe (Beta)" only if your kia_uvo region setting is "Europe (Beta)"
       options:
         - Europe
+        - Europe (Beta)
         - Canada
         - United States
         - Australia
@@ -40,6 +41,14 @@ body:
       label: Version of the Integration
       description: Provide the version number you are using
       placeholder: e.g., 3.11.0
+    validations:
+      required: true
+  - type: input
+    id: homeassistant_version
+    attributes:
+      label: Version of Home Assistant
+      description: Provide the version of Home Assistant you are running
+      placeholder: e.g., 2026.8.0
     validations:
       required: true
   - type: textarea
