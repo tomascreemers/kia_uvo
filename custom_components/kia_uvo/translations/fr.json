@@ -68,7 +68,8 @@
     "error": {
       "invalid_auth": "Authentification échouée aux serveurs Hyundai (Bluelink) / Kia (Uvo) Connect. Déconnectez-vous et reconnectez-vous sur l'application officielle puis ré-essayez!",
       "invalid_credentials": "Nom d'utilisateur ou mot de passe invalide",
-      "unknown": "Erreur non gérée"
+      "unknown": "Erreur non gérée",
+      "password_truncated_hint": "Échec de l'authentification. Si votre mot de passe dépasse 20 caractères, le compte n'accepte peut-être que les 20 premiers (observé sur des comptes européens Hyundai/Kia/Genesis lorsque le mot de passe a été défini sur un téléphone). Essayez les 20 premiers caractères."
     }
   },
   "options": {
@@ -595,6 +596,41 @@
       },
       "svm_status": {
         "name": "État SVM"
+      },
+      "gear_position": {
+        "name": "Position de la transmission"
+      },
+      "steering_wheel_heat_step": {
+        "name": "Niveau de chauffage du volant"
+      },
+      "average_fuel_economy_accumulated": {
+        "name": "Consommation moyenne (totale)"
+      },
+      "average_fuel_economy_drive": {
+        "name": "Consommation moyenne (par trajet)"
+      },
+      "average_fuel_economy_after_refuel": {
+        "name": "Consommation moyenne (après ravitaillement)"
+      },
+      "ev_v2l_discharge_dte": {
+        "name": "Autonomie de décharge V2L"
+      },
+      "ev_v2l_discharge_remain_time": {
+        "name": "Temps de décharge restant V2L"
+      },
+      "ev_v2l_mode": {
+        "name": "Mode V2L"
+      },
+      "ev_connector_lock_state": {
+        "name": "État de verrouillage du connecteur de charge",
+        "state": {
+          "idle": "Inactif",
+          "unlocked": "Déverrouillé",
+          "locked": "Verrouillé",
+          "releasing": "Libération",
+          "locking": "Verrouillage",
+          "released": "Libéré"
+        }
       }
     },
     "binary_sensor": {
@@ -916,6 +952,15 @@
       },
       "ev_off_peak_charge_only_enabled": {
         "name": "Charge en heures creuses uniquement"
+      },
+      "ev_charge_complete_alarm_before_10min": {
+        "name": "Alerte de fin de charge (10 min avant)"
+      },
+      "ev_charge_complete_alarm_before_20min": {
+        "name": "Alerte de fin de charge (20 min avant)"
+      },
+      "ev_charge_complete_alarm_before_30min": {
+        "name": "Alerte de fin de charge (30 min avant)"
       },
       "ev_schedule_charge_enabled": {
         "name": "Charge programmée"
