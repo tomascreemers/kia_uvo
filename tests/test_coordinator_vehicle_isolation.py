@@ -72,7 +72,6 @@ def _make_coordinator(
     coordinator.force_refresh_interval = 1440
     coordinator._failed_vehicles = set()
     coordinator._vehicle_failures = {}
-    coordinator._force_refresh_failed = set()
 
     failures = failures or {}
     cached_failures = failures if cached_failures is None else cached_failures

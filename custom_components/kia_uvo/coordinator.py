@@ -95,8 +95,6 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
         self._failed_vehicles: set[str] = set()
         # Consecutive failed polls per vehicle (drives the "skip it" hint).
         self._vehicle_failures: dict[str, int] = {}
-        # Vehicles whose last force refresh failed and whose cache wasn't read since.
-        self._force_refresh_failed: set[str] = set()
 
         self.vehicle_manager = VehicleManager(
             region=config_entry.data[CONF_REGION],
@@ -260,11 +258,6 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
 
     async def _async_poll_vehicle(self, vehicle_id: str, *, mode: PollMode) -> None:
         """Update one vehicle, falling back to the cached state if a force fails."""
-        # A force refresh that timed out has often still reached the car,
-        # whose answer lands in the cache up to two minutes later. Read it
-        # before deciding to wake the car again.
-        if mode == "check" and vehicle_id in self._force_refresh_failed:
-            mode = "cached"
         try:
             if mode == "check":
                 await self.hass.async_add_executor_job(
@@ -283,8 +276,6 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
         except Exception as err:
             if mode == "cached":
                 raise
-            if mode == "check":
-                self._force_refresh_failed.add(vehicle_id)
             _LOGGER.warning(
                 "%s - Force refresh failed for %s (%s), using cached state: %s",
                 DOMAIN,
@@ -295,8 +286,6 @@ class HyundaiKiaConnectDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any
             await self.hass.async_add_executor_job(
                 self.vehicle_manager.update_vehicle_with_cached_state, vehicle_id
             )
-        else:
-            self._force_refresh_failed.discard(vehicle_id)
 
     def _log_vehicle_failure(self, vehicle_id: str, err: Exception) -> None:
         vehicle = self.vehicle_manager.vehicles[vehicle_id]
