@@ -17,7 +17,6 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntry
 
-from . import force_refresh_probe
 from .const import (
     BRANDS,
     CONF_BRAND,
@@ -59,7 +58,6 @@ async def async_setup(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Set up Hyundai / Kia Connect from a config entry."""
     coordinator = HyundaiKiaConnectDataUpdateCoordinator(hass, config_entry)
-    force_refresh_probe.install(hass, coordinator.vehicle_manager)
     try:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryAuthFailed:
